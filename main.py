@@ -13,8 +13,8 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 import bcrypt
-import jwt
-from fastapi import FastAPI, Depends, HTTPException, WebSocket, WebSocketDisconnect, Query, status
+from jose import jwt, JWTError
+from fastapi import FastAPI, Depends, HTTPException, WebSocket, WebSocketDisconnect, Query
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel, EmailStr
 from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, create_engine, or_
@@ -34,10 +34,12 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 7 days
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL environment variable is required")
 
-# Neon requires SSL
+# Neon requires SSL. The connection string may already include sslmode,
+# but passing it again via connect_args is harmless and ensures it.
 engine = create_engine(DATABASE_URL, pool_pre_ping=True, connect_args={"sslmode": "require"})
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
+
 
 # ---------------------------------------------------------------------
 # Database models
@@ -68,6 +70,7 @@ class Message(Base):
 
 
 Base.metadata.create_all(bind=engine)
+
 
 # ---------------------------------------------------------------------
 # Schemas
@@ -122,7 +125,7 @@ def create_access_token(user_id: int, username: str) -> str:
 def decode_token(token: str) -> Optional[dict]:
     try:
         return jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-    except jwt.PyJWTError:
+    except JWTError:
         return None
 
 
@@ -160,7 +163,6 @@ def register(data: UserCreate, db: Session = Depends(get_db)):
     if not data.email and not data.phone:
         raise HTTPException(status_code=400, detail="Provide either email or phone")
 
-    # Check uniqueness
     if db.query(User).filter(User.username == data.username).first():
         raise HTTPException(status_code=400, detail="Username already taken")
     if data.email and db.query(User).filter(User.email == data.email).first():
@@ -183,7 +185,7 @@ def register(data: UserCreate, db: Session = Depends(get_db)):
 
 @app.post("/auth/login", response_model=Token)
 def login(form: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
-    # Allow login by username OR email
+    # Allow login by username OR email in the 'username' field
     user = db.query(User).filter(
         or_(User.username == form.username, User.email == form.username)
     ).first()
@@ -200,7 +202,7 @@ def me(user: User = Depends(get_current_user)):
 
 
 # ---------------------------------------------------------------------
-# Chat REST (history)
+# Chat REST (history + user search)
 # ---------------------------------------------------------------------
 
 @app.get("/messages/{other_user_id}")
@@ -293,7 +295,7 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
             data = await websocket.receive_json()
             # Expected: {"to": <user_id>, "content": "..."}
             receiver_id = data.get("to")
-            content = data.get("content", "").strip()
+            content = (data.get("content") or "").strip()
 
             if not receiver_id or not content:
                 continue
