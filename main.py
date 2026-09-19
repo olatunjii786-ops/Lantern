@@ -2,22 +2,27 @@
 Lantern Backend — FastAPI + Neon Postgres + JWT + WebSockets
 Single-file backend for the Lantern chat app.
 
-Deploy to Render with:
-- Environment variables: DATABASE_URL, SECRET_KEY
-- Health endpoint /health for cron-job.org keep-alive
+Features:
+- Signup with username + (email OR phone)
+- Login (username or email)
+- Interests & bio on user profiles
+- Discover feed (matching interests + online + recently joined)
+- Random user suggestion
+- 1-to-1 chat history
+- WebSocket real-time messaging
 """
 
 import os
 import secrets
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Optional, List
 
 import bcrypt
 from jose import jwt, JWTError
 from fastapi import FastAPI, Depends, HTTPException, WebSocket, WebSocketDisconnect, Query
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel, EmailStr
-from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, create_engine, or_
+from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, create_engine, or_, func, text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session, relationship
 from sqlalchemy.sql import func
@@ -31,11 +36,11 @@ SECRET_KEY = os.environ.get("SECRET_KEY", secrets.token_hex(32))
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 7 days
 
+ONLINE_WINDOW_SECONDS = 300  # user counts as "online" if seen within 5 minutes
+
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL environment variable is required")
 
-# Neon requires SSL. The connection string may already include sslmode,
-# but passing it again via connect_args is harmless and ensures it.
 engine = create_engine(DATABASE_URL, pool_pre_ping=True, connect_args={"sslmode": "require"})
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
@@ -53,6 +58,9 @@ class User(Base):
     email = Column(String, unique=True, index=True, nullable=True)
     phone = Column(String, unique=True, index=True, nullable=True)
     hashed_password = Column(String, nullable=False)
+    bio = Column(String, nullable=True)
+    interests = Column(String, nullable=True)   # comma-separated, e.g. "music,gaming,coding"
+    last_seen = Column(DateTime(timezone=True), server_default=func.now())
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -71,6 +79,21 @@ class Message(Base):
 
 Base.metadata.create_all(bind=engine)
 
+# ---------------------------------------------------------------------
+# Idempotent migration for existing databases
+# ---------------------------------------------------------------------
+
+def _ensure_column(table: str, column: str, coltype: str):
+    with engine.begin() as conn:
+        try:
+            conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}"))
+        except Exception:
+            pass  # column already exists
+
+_ensure_column("users", "bio", "VARCHAR")
+_ensure_column("users", "interests", "VARCHAR")
+_ensure_column("users", "last_seen", "TIMESTAMP WITH TIME ZONE")
+
 
 # ---------------------------------------------------------------------
 # Schemas
@@ -81,6 +104,8 @@ class UserCreate(BaseModel):
     email: Optional[EmailStr] = None
     phone: Optional[str] = None
     password: str
+    interests: Optional[List[str]] = None
+    bio: Optional[str] = None
 
 
 class UserOut(BaseModel):
@@ -88,6 +113,9 @@ class UserOut(BaseModel):
     username: str
     email: Optional[str]
     phone: Optional[str]
+    bio: Optional[str]
+    interests: Optional[str]
+    online: bool
 
     class Config:
         from_attributes = True
@@ -96,6 +124,20 @@ class UserOut(BaseModel):
 class Token(BaseModel):
     access_token: str
     token_type: str = "bearer"
+
+
+class ProfileUpdate(BaseModel):
+    bio: Optional[str] = None
+    interests: Optional[List[str]] = None
+
+
+class DiscoverUser(BaseModel):
+    id: int
+    username: str
+    bio: Optional[str]
+    interests: List[str]
+    online: bool
+    shared_interests: List[str]
 
 
 # ---------------------------------------------------------------------
@@ -144,7 +186,33 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
     user = db.query(User).filter(User.id == int(payload["sub"])).first()
     if not user:
         raise HTTPException(status_code=401, detail="User not found")
+    # bump last_seen
+    user.last_seen = datetime.utcnow()
+    db.commit()
     return user
+
+
+# ---------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------
+
+def parse_interests(raw: Optional[str]) -> List[str]:
+    if not raw:
+        return []
+    return [t.strip().lower() for t in raw.split(",") if t.strip()]
+
+
+def serialize_interests(tags: Optional[List[str]]) -> Optional[str]:
+    if not tags:
+        return None
+    return ",".join(t.strip().lower() for t in tags if t.strip())
+
+
+def is_online(user: User) -> bool:
+    if not user.last_seen:
+        return False
+    delta = datetime.utcnow() - user.last_seen.replace(tzinfo=None)
+    return delta.total_seconds() <= ONLINE_WINDOW_SECONDS
 
 
 # ---------------------------------------------------------------------
@@ -152,6 +220,11 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
 # ---------------------------------------------------------------------
 
 app = FastAPI(title="Lantern Backend")
+
+
+@app.get("/")
+def root():
+    return {"app": "Lantern", "status": "running"}
 
 
 # ---------------------------------------------------------------------
@@ -175,6 +248,9 @@ def register(data: UserCreate, db: Session = Depends(get_db)):
         email=data.email,
         phone=data.phone,
         hashed_password=hash_password(data.password),
+        bio=data.bio,
+        interests=serialize_interests(data.interests),
+        last_seen=datetime.utcnow(),
     )
     db.add(user)
     db.commit()
@@ -185,7 +261,6 @@ def register(data: UserCreate, db: Session = Depends(get_db)):
 
 @app.post("/auth/login", response_model=Token)
 def login(form: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
-    # Allow login by username OR email in the 'username' field
     user = db.query(User).filter(
         or_(User.username == form.username, User.email == form.username)
     ).first()
@@ -193,25 +268,143 @@ def login(form: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get
     if not user or not verify_password(form.password, user.hashed_password):
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
+    user.last_seen = datetime.utcnow()
+    db.commit()
+
     return Token(access_token=create_access_token(user.id, user.username))
 
 
 @app.get("/auth/me", response_model=UserOut)
 def me(user: User = Depends(get_current_user)):
-    return user
+    return UserOut(
+        id=user.id,
+        username=user.username,
+        email=user.email,
+        phone=user.phone,
+        bio=user.bio,
+        interests=user.interests,
+        online=True,
+    )
+
+
+@app.put("/users/me", response_model=UserOut)
+def update_profile(data: ProfileUpdate,
+                   user: User = Depends(get_current_user),
+                   db: Session = Depends(get_db)):
+    if data.bio is not None:
+        user.bio = data.bio
+    if data.interests is not None:
+        user.interests = serialize_interests(data.interests)
+    db.commit()
+    db.refresh(user)
+    return UserOut(
+        id=user.id,
+        username=user.username,
+        email=user.email,
+        phone=user.phone,
+        bio=user.bio,
+        interests=user.interests,
+        online=True,
+    )
 
 
 # ---------------------------------------------------------------------
-# Chat REST (history + user search)
+# Discover
+# ---------------------------------------------------------------------
+
+@app.get("/users/discover", response_model=List[DiscoverUser])
+def discover(limit: int = 30,
+             user: User = Depends(get_current_user),
+             db: Session = Depends(get_db)):
+    """Return a mix of users: interest matches first, then online, then recent."""
+    my_interests = set(parse_interests(user.interests))
+
+    # Pull a reasonably sized pool, then sort in Python
+    pool = (db.query(User)
+            .filter(User.id != user.id)
+            .order_by(User.last_seen.desc().nullslast())
+            .limit(200)
+            .all())
+
+    def score(u: User):
+        theirs = set(parse_interests(u.interests))
+        shared = my_interests & theirs
+        s = 0
+        s += len(shared) * 10
+        if is_online(u):
+            s += 5
+        return s
+
+    pool.sort(key=score, reverse=True)
+
+    out = []
+    for u in pool[:limit]:
+        theirs = parse_interests(u.interests)
+        shared = list(my_interests & set(theirs))
+        out.append(DiscoverUser(
+            id=u.id,
+            username=u.username,
+            bio=u.bio,
+            interests=theirs,
+            online=is_online(u),
+            shared_interests=shared,
+        ))
+    return out
+
+
+@app.get("/users/random", response_model=Optional[DiscoverUser])
+def random_user(user: User = Depends(get_current_user),
+                db: Session = Depends(get_db)):
+    u = (db.query(User)
+         .filter(User.id != user.id)
+         .order_by(func.random())
+         .first())
+    if not u:
+        return None
+    my_interests = set(parse_interests(user.interests))
+    theirs = parse_interests(u.interests)
+    return DiscoverUser(
+        id=u.id,
+        username=u.username,
+        bio=u.bio,
+        interests=theirs,
+        online=is_online(u),
+        shared_interests=list(my_interests & set(theirs)),
+    )
+
+
+@app.get("/users/search")
+def search_users(q: str,
+                 user: User = Depends(get_current_user),
+                 db: Session = Depends(get_db)):
+    results = (
+        db.query(User)
+        .filter(User.username.ilike(f"%{q}%"))
+        .filter(User.id != user.id)
+        .limit(20)
+        .all()
+    )
+    return [
+        {
+            "id": u.id,
+            "username": u.username,
+            "bio": u.bio,
+            "interests": parse_interests(u.interests),
+            "online": is_online(u),
+        }
+        for u in results
+    ]
+
+
+# ---------------------------------------------------------------------
+# Chat REST (history)
 # ---------------------------------------------------------------------
 
 @app.get("/messages/{other_user_id}")
-def get_messages(
-    other_user_id: int,
-    limit: int = 50,
-    user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
+def get_messages(other_user_id: int,
+                 limit: int = 50,
+                 user: User = Depends(get_current_user),
+                 db: Session = Depends(get_db)):
     msgs = (
         db.query(Message)
         .filter(
@@ -237,25 +430,12 @@ def get_messages(
     ]
 
 
-@app.get("/users/search")
-def search_users(q: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    results = (
-        db.query(User)
-        .filter(User.username.ilike(f"%{q}%"))
-        .filter(User.id != user.id)
-        .limit(20)
-        .all()
-    )
-    return [{"id": u.id, "username": u.username} for u in results]
-
-
 # ---------------------------------------------------------------------
 # WebSocket chat
 # ---------------------------------------------------------------------
 
 class ConnectionManager:
     def __init__(self):
-        # user_id -> WebSocket
         self.active: dict[int, WebSocket] = {}
 
     async def connect(self, user_id: int, websocket: WebSocket):
@@ -281,7 +461,7 @@ manager = ConnectionManager()
 async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
     payload = decode_token(token)
     if not payload:
-        await websocket.close(code=1008)  # policy violation
+        await websocket.close(code=1008)
         return
 
     user_id = int(payload["sub"])
@@ -289,11 +469,16 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
 
     await manager.connect(user_id, websocket)
 
+    # bump last_seen on connect
     db = SessionLocal()
     try:
+        u = db.query(User).filter(User.id == user_id).first()
+        if u:
+            u.last_seen = datetime.utcnow()
+            db.commit()
+
         while True:
             data = await websocket.receive_json()
-            # Expected: {"to": <user_id>, "content": "..."}
             receiver_id = data.get("to")
             content = (data.get("content") or "").strip()
 
@@ -305,6 +490,12 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
             db.commit()
             db.refresh(msg)
 
+            # bump last_seen
+            u = db.query(User).filter(User.id == user_id).first()
+            if u:
+                u.last_seen = datetime.utcnow()
+                db.commit()
+
             payload_out = {
                 "id": msg.id,
                 "from": user_id,
@@ -314,9 +505,7 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
                 "created_at": msg.created_at.isoformat(),
             }
 
-            # Echo to sender (confirmation)
             await manager.send_to(user_id, payload_out)
-            # Deliver to receiver if online
             await manager.send_to(receiver_id, payload_out)
 
     except WebSocketDisconnect:
@@ -328,7 +517,7 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
 
 
 # ---------------------------------------------------------------------
-# Health (for cron-job.org keep-alive)
+# Health
 # ---------------------------------------------------------------------
 
 @app.get("/health")
