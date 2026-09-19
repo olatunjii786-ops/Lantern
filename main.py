@@ -2,14 +2,21 @@
 Lantern Backend — FastAPI + Neon Postgres + JWT + WebSockets
 Single-file backend for the Lantern chat app.
 
-Features:
-- Signup with username + (email OR phone)
-- Login (username or email)
-- Interests & bio on user profiles
-- Discover feed (matching interests + online + recently joined)
-- Random user suggestion
-- 1-to-1 chat history
-- WebSocket real-time messaging
+Endpoints:
+- POST   /auth/register
+- POST   /auth/login
+- GET    /auth/me
+- PUT    /users/me
+- GET    /users/discover
+- GET    /users/random
+- GET    /users/search
+- GET    /conversations
+- GET    /messages/{other_user_id}
+- POST   /messages
+- DELETE /messages/{message_id}
+- DELETE /conversations/{other_user_id}
+- WS     /ws?token=...
+- GET    /health
 """
 
 import os
@@ -22,10 +29,9 @@ from jose import jwt, JWTError
 from fastapi import FastAPI, Depends, HTTPException, WebSocket, WebSocketDisconnect, Query
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel, EmailStr
-from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, create_engine, or_, func, text
+from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, create_engine, or_, and_, func, text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session, relationship
-from sqlalchemy.sql import func
 
 # ---------------------------------------------------------------------
 # Configuration
@@ -34,9 +40,8 @@ from sqlalchemy.sql import func
 DATABASE_URL = os.environ.get("DATABASE_URL")
 SECRET_KEY = os.environ.get("SECRET_KEY", secrets.token_hex(32))
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 7 days
-
-ONLINE_WINDOW_SECONDS = 300  # user counts as "online" if seen within 5 minutes
+ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7
+ONLINE_WINDOW_SECONDS = 300
 
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL environment variable is required")
@@ -47,7 +52,7 @@ Base = declarative_base()
 
 
 # ---------------------------------------------------------------------
-# Database models
+# Models
 # ---------------------------------------------------------------------
 
 class User(Base):
@@ -59,7 +64,7 @@ class User(Base):
     phone = Column(String, unique=True, index=True, nullable=True)
     hashed_password = Column(String, nullable=False)
     bio = Column(String, nullable=True)
-    interests = Column(String, nullable=True)   # comma-separated, e.g. "music,gaming,coding"
+    interests = Column(String, nullable=True)
     last_seen = Column(DateTime(timezone=True), server_default=func.now())
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
@@ -79,16 +84,13 @@ class Message(Base):
 
 Base.metadata.create_all(bind=engine)
 
-# ---------------------------------------------------------------------
-# Idempotent migration for existing databases
-# ---------------------------------------------------------------------
 
 def _ensure_column(table: str, column: str, coltype: str):
     with engine.begin() as conn:
         try:
             conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}"))
         except Exception:
-            pass  # column already exists
+            pass
 
 _ensure_column("users", "bio", "VARCHAR")
 _ensure_column("users", "interests", "VARCHAR")
@@ -140,8 +142,29 @@ class DiscoverUser(BaseModel):
     shared_interests: List[str]
 
 
+class ConversationOut(BaseModel):
+    user_id: int
+    username: str
+    last_message: str
+    last_timestamp: str
+    online: bool
+
+
+class SendMessageIn(BaseModel):
+    to: int
+    content: str
+
+
+class MessageOut(BaseModel):
+    id: int
+    sender_id: int
+    receiver_id: int
+    content: str
+    created_at: str
+
+
 # ---------------------------------------------------------------------
-# Security helpers
+# Helpers
 # ---------------------------------------------------------------------
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
@@ -186,15 +209,10 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
     user = db.query(User).filter(User.id == int(payload["sub"])).first()
     if not user:
         raise HTTPException(status_code=401, detail="User not found")
-    # bump last_seen
     user.last_seen = datetime.utcnow()
     db.commit()
     return user
 
-
-# ---------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------
 
 def parse_interests(raw: Optional[str]) -> List[str]:
     if not raw:
@@ -216,7 +234,7 @@ def is_online(user: User) -> bool:
 
 
 # ---------------------------------------------------------------------
-# FastAPI app
+# App
 # ---------------------------------------------------------------------
 
 app = FastAPI(title="Lantern Backend")
@@ -228,7 +246,7 @@ def root():
 
 
 # ---------------------------------------------------------------------
-# Auth endpoints
+# Auth
 # ---------------------------------------------------------------------
 
 @app.post("/auth/register", response_model=Token)
@@ -255,7 +273,6 @@ def register(data: UserCreate, db: Session = Depends(get_db)):
     db.add(user)
     db.commit()
     db.refresh(user)
-
     return Token(access_token=create_access_token(user.id, user.username))
 
 
@@ -264,26 +281,18 @@ def login(form: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get
     user = db.query(User).filter(
         or_(User.username == form.username, User.email == form.username)
     ).first()
-
     if not user or not verify_password(form.password, user.hashed_password):
         raise HTTPException(status_code=401, detail="Invalid credentials")
-
     user.last_seen = datetime.utcnow()
     db.commit()
-
     return Token(access_token=create_access_token(user.id, user.username))
 
 
 @app.get("/auth/me", response_model=UserOut)
 def me(user: User = Depends(get_current_user)):
     return UserOut(
-        id=user.id,
-        username=user.username,
-        email=user.email,
-        phone=user.phone,
-        bio=user.bio,
-        interests=user.interests,
-        online=True,
+        id=user.id, username=user.username, email=user.email, phone=user.phone,
+        bio=user.bio, interests=user.interests, online=True,
     )
 
 
@@ -298,13 +307,8 @@ def update_profile(data: ProfileUpdate,
     db.commit()
     db.refresh(user)
     return UserOut(
-        id=user.id,
-        username=user.username,
-        email=user.email,
-        phone=user.phone,
-        bio=user.bio,
-        interests=user.interests,
-        online=True,
+        id=user.id, username=user.username, email=user.email, phone=user.phone,
+        bio=user.bio, interests=user.interests, online=True,
     )
 
 
@@ -316,10 +320,7 @@ def update_profile(data: ProfileUpdate,
 def discover(limit: int = 30,
              user: User = Depends(get_current_user),
              db: Session = Depends(get_db)):
-    """Return a mix of users: interest matches first, then online, then recent."""
     my_interests = set(parse_interests(user.interests))
-
-    # Pull a reasonably sized pool, then sort in Python
     pool = (db.query(User)
             .filter(User.id != user.id)
             .order_by(User.last_seen.desc().nullslast())
@@ -328,9 +329,7 @@ def discover(limit: int = 30,
 
     def score(u: User):
         theirs = set(parse_interests(u.interests))
-        shared = my_interests & theirs
-        s = 0
-        s += len(shared) * 10
+        s = len(my_interests & theirs) * 10
         if is_online(u):
             s += 5
         return s
@@ -340,14 +339,9 @@ def discover(limit: int = 30,
     out = []
     for u in pool[:limit]:
         theirs = parse_interests(u.interests)
-        shared = list(my_interests & set(theirs))
         out.append(DiscoverUser(
-            id=u.id,
-            username=u.username,
-            bio=u.bio,
-            interests=theirs,
-            online=is_online(u),
-            shared_interests=shared,
+            id=u.id, username=u.username, bio=u.bio, interests=theirs,
+            online=is_online(u), shared_interests=list(my_interests & set(theirs)),
         ))
     return out
 
@@ -364,12 +358,8 @@ def random_user(user: User = Depends(get_current_user),
     my_interests = set(parse_interests(user.interests))
     theirs = parse_interests(u.interests)
     return DiscoverUser(
-        id=u.id,
-        username=u.username,
-        bio=u.bio,
-        interests=theirs,
-        online=is_online(u),
-        shared_interests=list(my_interests & set(theirs)),
+        id=u.id, username=u.username, bio=u.bio, interests=theirs,
+        online=is_online(u), shared_interests=list(my_interests & set(theirs)),
     )
 
 
@@ -377,27 +367,76 @@ def random_user(user: User = Depends(get_current_user),
 def search_users(q: str,
                  user: User = Depends(get_current_user),
                  db: Session = Depends(get_db)):
-    results = (
-        db.query(User)
-        .filter(User.username.ilike(f"%{q}%"))
-        .filter(User.id != user.id)
-        .limit(20)
-        .all()
-    )
+    results = (db.query(User)
+               .filter(User.username.ilike(f"%{q}%"))
+               .filter(User.id != user.id)
+               .limit(20).all())
     return [
         {
-            "id": u.id,
-            "username": u.username,
-            "bio": u.bio,
-            "interests": parse_interests(u.interests),
-            "online": is_online(u),
+            "id": u.id, "username": u.username, "bio": u.bio,
+            "interests": parse_interests(u.interests), "online": is_online(u),
         }
         for u in results
     ]
 
 
 # ---------------------------------------------------------------------
-# Chat REST (history)
+# Conversations
+# ---------------------------------------------------------------------
+
+@app.get("/conversations", response_model=List[ConversationOut])
+def conversations(user: User = Depends(get_current_user),
+                  db: Session = Depends(get_db)):
+    sql = text("""
+        SELECT
+            CASE WHEN sender_id = :me THEN receiver_id ELSE sender_id END AS other_id,
+            content,
+            created_at
+        FROM (
+            SELECT *,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY CASE WHEN sender_id = :me THEN receiver_id ELSE sender_id END
+                       ORDER BY created_at DESC
+                   ) AS rn
+            FROM messages
+            WHERE sender_id = :me OR receiver_id = :me
+        ) t
+        WHERE rn = 1
+        ORDER BY created_at DESC
+    """)
+    rows = db.execute(sql, {"me": user.id}).fetchall()
+
+    out = []
+    for other_id, content, created_at in rows:
+        u = db.query(User).filter(User.id == other_id).first()
+        if not u:
+            continue
+        out.append(ConversationOut(
+            user_id=u.id,
+            username=u.username,
+            last_message=content,
+            last_timestamp=created_at.isoformat(),
+            online=is_online(u),
+        ))
+    return out
+
+
+@app.delete("/conversations/{other_user_id}")
+def delete_conversation(other_user_id: int,
+                        user: User = Depends(get_current_user),
+                        db: Session = Depends(get_db)):
+    deleted = (db.query(Message)
+               .filter(or_(
+                   and_(Message.sender_id == user.id, Message.receiver_id == other_user_id),
+                   and_(Message.sender_id == other_user_id, Message.receiver_id == user.id),
+               ))
+               .delete(synchronize_session=False))
+    db.commit()
+    return {"deleted": deleted}
+
+
+# ---------------------------------------------------------------------
+# Messages
 # ---------------------------------------------------------------------
 
 @app.get("/messages/{other_user_id}")
@@ -405,18 +444,13 @@ def get_messages(other_user_id: int,
                  limit: int = 50,
                  user: User = Depends(get_current_user),
                  db: Session = Depends(get_db)):
-    msgs = (
-        db.query(Message)
-        .filter(
-            or_(
-                (Message.sender_id == user.id) & (Message.receiver_id == other_user_id),
-                (Message.sender_id == other_user_id) & (Message.receiver_id == user.id),
-            )
-        )
-        .order_by(Message.created_at.desc())
-        .limit(limit)
-        .all()
-    )
+    msgs = (db.query(Message)
+            .filter(or_(
+                and_(Message.sender_id == user.id, Message.receiver_id == other_user_id),
+                and_(Message.sender_id == other_user_id, Message.receiver_id == user.id),
+            ))
+            .order_by(Message.created_at.desc())
+            .limit(limit).all())
     msgs.reverse()
     return [
         {
@@ -430,8 +464,64 @@ def get_messages(other_user_id: int,
     ]
 
 
+@app.post("/messages", response_model=MessageOut)
+def post_message(data: SendMessageIn,
+                 user: User = Depends(get_current_user),
+                 db: Session = Depends(get_db)):
+    """REST fallback for sending a message. WebSocket is preferred,
+    but this lets you test from /docs and gives the Android client
+    a reliable path if the WS ever drops."""
+    if not data.content.strip():
+        raise HTTPException(status_code=400, detail="Empty message")
+    receiver = db.query(User).filter(User.id == data.to).first()
+    if not receiver:
+        raise HTTPException(status_code=404, detail="Recipient not found")
+
+    msg = Message(sender_id=user.id, receiver_id=data.to, content=data.content.strip())
+    db.add(msg)
+    db.commit()
+    db.refresh(msg)
+
+    # best-effort push over WebSocket if recipient is online
+    payload_out = {
+        "id": msg.id,
+        "from": user.id,
+        "from_username": user.username,
+        "to": data.to,
+        "content": msg.content,
+        "created_at": msg.created_at.isoformat(),
+    }
+    try:
+        import asyncio
+        asyncio.create_task(manager.send_to(data.to, payload_out))
+    except Exception:
+        pass
+
+    return MessageOut(
+        id=msg.id,
+        sender_id=msg.sender_id,
+        receiver_id=msg.receiver_id,
+        content=msg.content,
+        created_at=msg.created_at.isoformat(),
+    )
+
+
+@app.delete("/messages/{message_id}")
+def delete_message(message_id: int,
+                   user: User = Depends(get_current_user),
+                   db: Session = Depends(get_db)):
+    m = db.query(Message).filter(Message.id == message_id).first()
+    if not m:
+        raise HTTPException(status_code=404, detail="Message not found")
+    if m.sender_id != user.id and m.receiver_id != user.id:
+        raise HTTPException(status_code=403, detail="Not your message")
+    db.delete(m)
+    db.commit()
+    return {"deleted": True}
+
+
 # ---------------------------------------------------------------------
-# WebSocket chat
+# WebSocket
 # ---------------------------------------------------------------------
 
 class ConnectionManager:
@@ -469,7 +559,6 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
 
     await manager.connect(user_id, websocket)
 
-    # bump last_seen on connect
     db = SessionLocal()
     try:
         u = db.query(User).filter(User.id == user_id).first()
@@ -490,7 +579,6 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
             db.commit()
             db.refresh(msg)
 
-            # bump last_seen
             u = db.query(User).filter(User.id == user_id).first()
             if u:
                 u.last_seen = datetime.utcnow()
