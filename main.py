@@ -11,10 +11,11 @@ from typing import Optional, List
 
 import bcrypt
 from jose import jwt, JWTError
-from fastapi import FastAPI, Depends, HTTPException, WebSocket, WebSocketDisconnect, Query
+from fastapi import FastAPI, Depends, HTTPException, WebSocket, WebSocketDisconnect, Query, Header, Request
+from fastapi.responses import HTMLResponse
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel, EmailStr
-from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Text, create_engine, or_, and_, func, text
+from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Text, Boolean, create_engine, or_, and_, func, text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session, relationship
 
@@ -24,10 +25,11 @@ from sqlalchemy.orm import sessionmaker, Session, relationship
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 SECRET_KEY = os.environ.get("SECRET_KEY", secrets.token_hex(32))
+ADMIN_KEY = os.environ.get("ADMIN_KEY", "")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7
 ONLINE_WINDOW_SECONDS = 300
-MAX_AVATAR_BYTES = 200_000  # ~200 KB base64-encoded JPEG, plenty for 200x200
+MAX_AVATAR_BYTES = 200_000
 
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL environment variable is required")
@@ -51,7 +53,7 @@ class User(Base):
     hashed_password = Column(String, nullable=False)
     bio = Column(String, nullable=True)
     interests = Column(String, nullable=True)
-    avatar = Column(Text, nullable=True)  # base64 data URL, e.g. "data:image/jpeg;base64,..."
+    avatar = Column(Text, nullable=True)
     last_seen = Column(DateTime(timezone=True), server_default=func.now())
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
@@ -67,6 +69,18 @@ class Message(Base):
 
     sender = relationship("User", foreign_keys=[sender_id])
     receiver = relationship("User", foreign_keys=[receiver_id])
+
+
+class Release(Base):
+    __tablename__ = "releases"
+
+    id = Column(Integer, primary_key=True, index=True)
+    version_code = Column(Integer, nullable=False, index=True)
+    version_name = Column(String, nullable=False)
+    download_url = Column(String, nullable=False)
+    notes = Column(Text, nullable=True)
+    blocking = Column(Boolean, default=False, nullable=False)
+    published_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
 Base.metadata.create_all(bind=engine)
@@ -122,7 +136,7 @@ class ProfileUpdate(BaseModel):
     bio: Optional[str] = None
     phone: Optional[str] = None
     interests: Optional[List[str]] = None
-    avatar: Optional[str] = None  # data URL or base64; None means "don't change"
+    avatar: Optional[str] = None
 
 
 class DiscoverUser(BaseModel):
@@ -155,6 +169,23 @@ class MessageOut(BaseModel):
     receiver_id: int
     content: str
     created_at: str
+
+
+class ReleaseCreate(BaseModel):
+    version_code: int
+    version_name: str
+    download_url: str
+    notes: Optional[str] = ""
+    blocking: Optional[bool] = False
+
+
+class ReleaseOut(BaseModel):
+    version_code: int
+    version_name: str
+    download_url: str
+    notes: str
+    blocking: bool
+    published_at: str
 
 
 # ---------------------------------------------------------------------
@@ -208,6 +239,13 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
     return user
 
 
+def require_admin(key: Optional[str]):
+    if not ADMIN_KEY:
+        raise HTTPException(status_code=500, detail="ADMIN_KEY not configured on server")
+    if key != ADMIN_KEY:
+        raise HTTPException(status_code=401, detail="Bad admin key")
+
+
 def parse_interests(raw: Optional[str]) -> List[str]:
     if not raw:
         return []
@@ -228,19 +266,14 @@ def is_online(user: User) -> bool:
 
 
 def validate_avatar(avatar: Optional[str]) -> Optional[str]:
-    """Accepts a base64 data URL or raw base64. Returns normalized data URL."""
     if avatar is None:
         return None
     if avatar == "":
         return None
     if len(avatar) > MAX_AVATAR_BYTES:
         raise HTTPException(status_code=400, detail="Avatar too large")
-
-    # Already a data URL
     if avatar.startswith("data:image/"):
         return avatar
-
-    # Raw base64 — assume JPEG
     try:
         base64.b64decode(avatar, validate=True)
     except Exception:
@@ -332,7 +365,6 @@ def update_profile(data: ProfileUpdate,
         if p == "":
             user.phone = None
         else:
-            # Phone uniqueness check
             existing = db.query(User).filter(User.phone == p, User.id != user.id).first()
             if existing:
                 raise HTTPException(status_code=400, detail="Phone already registered")
@@ -561,6 +593,363 @@ def delete_message(message_id: int,
     db.delete(m)
     db.commit()
     return {"deleted": True}
+
+
+# ---------------------------------------------------------------------
+# Release / update endpoints
+# ---------------------------------------------------------------------
+
+@app.get("/app/version", response_model=Optional[ReleaseOut])
+def app_version(db: Session = Depends(get_db)):
+    """Public endpoint. Returns the newest release, or 404 if none published."""
+    latest = (db.query(Release)
+              .order_by(Release.version_code.desc())
+              .first())
+    if not latest:
+        raise HTTPException(status_code=404, detail="No releases published yet")
+    return ReleaseOut(
+        version_code=latest.version_code,
+        version_name=latest.version_name,
+        download_url=latest.download_url,
+        notes=latest.notes or "",
+        blocking=latest.blocking,
+        published_at=latest.published_at.isoformat(),
+    )
+
+
+@app.get("/admin/releases", response_model=List[ReleaseOut])
+def admin_list_releases(x_admin_key: Optional[str] = Header(None),
+                        db: Session = Depends(get_db)):
+    require_admin(x_admin_key)
+    rows = db.query(Release).order_by(Release.version_code.desc()).all()
+    return [
+        ReleaseOut(
+            version_code=r.version_code,
+            version_name=r.version_name,
+            download_url=r.download_url,
+            notes=r.notes or "",
+            blocking=r.blocking,
+            published_at=r.published_at.isoformat(),
+        ) for r in rows
+    ]
+
+
+@app.post("/admin/releases", response_model=ReleaseOut)
+def admin_publish_release(data: ReleaseCreate,
+                          x_admin_key: Optional[str] = Header(None),
+                          db: Session = Depends(get_db)):
+    require_admin(x_admin_key)
+
+    existing = db.query(Release).filter(Release.version_code == data.version_code).first()
+    if existing:
+        # Update existing
+        existing.version_name = data.version_name
+        existing.download_url = data.download_url
+        existing.notes = data.notes or ""
+        existing.blocking = bool(data.blocking)
+    else:
+        r = Release(
+            version_code=data.version_code,
+            version_name=data.version_name,
+            download_url=data.download_url,
+            notes=data.notes or "",
+            blocking=bool(data.blocking),
+        )
+        db.add(r)
+    db.commit()
+
+    latest = db.query(Release).filter(Release.version_code == data.version_code).first()
+    return ReleaseOut(
+        version_code=latest.version_code,
+        version_name=latest.version_name,
+        download_url=latest.download_url,
+        notes=latest.notes or "",
+        blocking=latest.blocking,
+        published_at=latest.published_at.isoformat(),
+    )
+
+
+@app.delete("/admin/releases/{version_code}")
+def admin_delete_release(version_code: int,
+                         x_admin_key: Optional[str] = Header(None),
+                         db: Session = Depends(get_db)):
+    require_admin(x_admin_key)
+    deleted = db.query(Release).filter(Release.version_code == version_code).delete()
+    db.commit()
+    return {"deleted": deleted}
+
+
+# ---------------------------------------------------------------------
+# Admin panel (single HTML page served from FastAPI)
+# ---------------------------------------------------------------------
+
+ADMIN_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Lantern — Admin</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 24px;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: #0a0a14; color: #f2f2f7;
+  }
+  .wrap { max-width: 640px; margin: 0 auto; }
+  h1 { font-size: 22px; font-weight: 400; margin: 0 0 4px; }
+  .sub { color: #8e8ea8; font-size: 13px; margin-bottom: 24px; }
+  .card {
+    background: #1a1a2e; border-radius: 14px;
+    padding: 18px; margin-bottom: 16px;
+  }
+  label { display: block; font-size: 12px; color: #8e8ea8; margin-bottom: 6px; }
+  input, textarea {
+    width: 100%; padding: 12px; border: 0; border-radius: 10px;
+    background: #22223a; color: #f2f2f7; font-size: 14px;
+    font-family: inherit; outline: none;
+  }
+  textarea { min-height: 80px; resize: vertical; }
+  input:focus, textarea:focus { background: #2a2a44; }
+  .row { display: flex; gap: 10px; }
+  .row > div { flex: 1; }
+  .field { margin-bottom: 12px; }
+  .checkbox-row { display: flex; align-items: center; gap: 8px; margin: 12px 0; }
+  .checkbox-row input { width: auto; }
+  .checkbox-row label { margin: 0; color: #f2f2f7; font-size: 14px; }
+  button {
+    padding: 12px 20px; border: 0; border-radius: 12px;
+    font-size: 14px; font-weight: 500; cursor: pointer;
+    font-family: inherit;
+  }
+  .primary { background: #ff5c39; color: #fff; width: 100%; }
+  .primary:disabled { opacity: 0.5; cursor: not-allowed; }
+  .release {
+    display: flex; align-items: flex-start; gap: 12px;
+    padding: 12px; border-radius: 10px; background: #22223a;
+    margin-bottom: 8px;
+  }
+  .release-info { flex: 1; font-size: 13px; }
+  .release-title { font-weight: 500; margin-bottom: 4px; }
+  .release-meta { color: #8e8ea8; font-size: 12px; }
+  .badge {
+    display: inline-block; padding: 2px 8px; border-radius: 8px;
+    font-size: 11px; margin-left: 6px;
+  }
+  .badge-block { background: #8a2e1a; color: #fff; }
+  .badge-ok { background: #2a2a44; color: #8e8ea8; }
+  .delete-btn {
+    background: transparent; color: #8e8ea8; font-size: 12px;
+    padding: 4px 8px;
+  }
+  .delete-btn:hover { color: #ff5c39; }
+  .toast {
+    position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
+    background: #22223a; color: #fff; padding: 12px 20px;
+    border-radius: 10px; font-size: 13px; opacity: 0;
+    transition: opacity 0.3s; pointer-events: none;
+  }
+  .toast.show { opacity: 1; }
+  .error { color: #ff5c39; font-size: 13px; margin-top: 8px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Lantern — Admin</h1>
+  <div class="sub">Publish updates to all users</div>
+
+  <div class="card">
+    <div class="field">
+      <label>Admin key</label>
+      <input id="key" type="password" placeholder="Paste ADMIN_KEY" oninput="onKeyInput()">
+    </div>
+  </div>
+
+  <div class="card">
+    <h3 style="margin-top:0;font-size:15px;font-weight:500">Publish a release</h3>
+    <div class="row">
+      <div class="field">
+        <label>Version code (integer)</label>
+        <input id="vcode" type="number" placeholder="5">
+      </div>
+      <div class="field">
+        <label>Version name</label>
+        <input id="vname" type="text" placeholder="1.4">
+      </div>
+    </div>
+    <div class="field">
+      <label>Download URL</label>
+      <input id="url" type="text" placeholder="https://github.com/.../lantern.apk">
+    </div>
+    <div class="field">
+      <label>Release notes</label>
+      <textarea id="notes" placeholder="What changed?"></textarea>
+    </div>
+    <div class="checkbox-row">
+      <input id="blocking" type="checkbox">
+      <label for="blocking">Block users below this version (use carefully)</label>
+    </div>
+    <button class="primary" id="publishBtn" onclick="publish()">Publish</button>
+    <div class="error" id="error"></div>
+  </div>
+
+  <div class="card">
+    <h3 style="margin-top:0;font-size:15px;font-weight:500">Published releases</h3>
+    <div id="list" style="margin-top:12px"></div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const API = "";
+let allReleases = [];
+
+function toast(msg) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.classList.add('show');
+  setTimeout(() => t.classList.remove('show'), 2000);
+}
+
+function onKeyInput() {
+  // Auto-fill from URL hash if provided
+  const key = document.getElementById('key').value;
+  if (key.length > 0) loadReleases();
+}
+
+async function loadReleases() {
+  const key = document.getElementById('key').value;
+  if (!key) return;
+  try {
+    const r = await fetch('/admin/releases', {
+      headers: { 'X-Admin-Key': key }
+    });
+    if (!r.ok) {
+      document.getElementById('list').innerHTML = '<div class="release-meta">Invalid admin key.</div>';
+      return;
+    }
+    allReleases = await r.json();
+    renderList();
+  } catch (e) {
+    document.getElementById('list').innerHTML = '<div class="release-meta">Network error.</div>';
+  }
+}
+
+function renderList() {
+  const list = document.getElementById('list');
+  if (allReleases.length === 0) {
+    list.innerHTML = '<div class="release-meta">No releases yet.</div>';
+    return;
+  }
+  list.innerHTML = '';
+  for (const r of allReleases) {
+    const el = document.createElement('div');
+    el.className = 'release';
+    const blocking = r.blocking
+      ? '<span class="badge badge-block">blocking</span>'
+      : '<span class="badge badge-ok">optional</span>';
+    el.innerHTML = `
+      <div class="release-info">
+        <div class="release-title">v${r.version_name} (code ${r.version_code}) ${blocking}</div>
+        <div class="release-meta">${r.download_url}</div>
+        <div class="release-meta">${r.notes || '(no notes)'}</div>
+      </div>
+      <button class="delete-btn" onclick="deleteRelease(${r.version_code})">Delete</button>
+    `;
+    list.appendChild(el);
+  }
+}
+
+async function publish() {
+  const key = document.getElementById('key').value;
+  if (!key) { document.getElementById('error').textContent = 'Enter admin key'; return; }
+
+  const vcode = parseInt(document.getElementById('vcode').value, 10);
+  const vname = document.getElementById('vname').value.trim();
+  const url = document.getElementById('url').value.trim();
+  const notes = document.getElementById('notes').value;
+  const blocking = document.getElementById('blocking').checked;
+
+  if (!vcode || !vname || !url) {
+    document.getElementById('error').textContent = 'All fields except notes are required';
+    return;
+  }
+
+  document.getElementById('error').textContent = '';
+  document.getElementById('publishBtn').disabled = true;
+
+  try {
+    const r = await fetch('/admin/releases', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Admin-Key': key
+      },
+      body: JSON.stringify({
+        version_code: vcode,
+        version_name: vname,
+        download_url: url,
+        notes: notes,
+        blocking: blocking
+      })
+    });
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({}));
+      document.getElementById('error').textContent = err.detail || 'Publish failed';
+    } else {
+      toast('Published v' + vname);
+      document.getElementById('vcode').value = '';
+      document.getElementById('vname').value = '';
+      document.getElementById('url').value = '';
+      document.getElementById('notes').value = '';
+      document.getElementById('blocking').checked = false;
+      loadReleases();
+    }
+  } catch (e) {
+    document.getElementById('error').textContent = 'Network error';
+  } finally {
+    document.getElementById('publishBtn').disabled = false;
+  }
+}
+
+async function deleteRelease(vcode) {
+  if (!confirm('Delete release code ' + vcode + '?')) return;
+  const key = document.getElementById('key').value;
+  try {
+    const r = await fetch('/admin/releases/' + vcode, {
+      method: 'DELETE',
+      headers: { 'X-Admin-Key': key }
+    });
+    if (r.ok) {
+      toast('Deleted');
+      loadReleases();
+    } else {
+      toast('Delete failed');
+    }
+  } catch (e) {
+    toast('Network error');
+  }
+}
+
+// Auto-fill key from ?key= in URL
+(function() {
+  const params = new URLSearchParams(window.location.search);
+  const k = params.get('key');
+  if (k) {
+    document.getElementById('key').value = k;
+    loadReleases();
+  }
+})();
+</script>
+</body>
+</html>
+"""
+
+
+@app.get("/admin", response_class=HTMLResponse)
+def admin_panel():
+    return HTMLResponse(content=ADMIN_HTML)
 
 
 # ---------------------------------------------------------------------
