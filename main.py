@@ -1,26 +1,11 @@
 """
 Lantern Backend — FastAPI + Neon Postgres + JWT + WebSockets
 Single-file backend for the Lantern chat app.
-
-Endpoints:
-- POST   /auth/register
-- POST   /auth/login
-- GET    /auth/me
-- PUT    /users/me
-- GET    /users/discover
-- GET    /users/random
-- GET    /users/search
-- GET    /conversations
-- GET    /messages/{other_user_id}
-- POST   /messages
-- DELETE /messages/{message_id}
-- DELETE /conversations/{other_user_id}
-- WS     /ws?token=...
-- GET    /health
 """
 
 import os
 import secrets
+import base64
 from datetime import datetime, timedelta
 from typing import Optional, List
 
@@ -29,12 +14,12 @@ from jose import jwt, JWTError
 from fastapi import FastAPI, Depends, HTTPException, WebSocket, WebSocketDisconnect, Query
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel, EmailStr
-from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, create_engine, or_, and_, func, text
+from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Text, create_engine, or_, and_, func, text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session, relationship
 
 # ---------------------------------------------------------------------
-# Configuration
+# Config
 # ---------------------------------------------------------------------
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
@@ -42,6 +27,7 @@ SECRET_KEY = os.environ.get("SECRET_KEY", secrets.token_hex(32))
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7
 ONLINE_WINDOW_SECONDS = 300
+MAX_AVATAR_BYTES = 200_000  # ~200 KB base64-encoded JPEG, plenty for 200x200
 
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL environment variable is required")
@@ -65,6 +51,7 @@ class User(Base):
     hashed_password = Column(String, nullable=False)
     bio = Column(String, nullable=True)
     interests = Column(String, nullable=True)
+    avatar = Column(Text, nullable=True)  # base64 data URL, e.g. "data:image/jpeg;base64,..."
     last_seen = Column(DateTime(timezone=True), server_default=func.now())
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
@@ -94,6 +81,7 @@ def _ensure_column(table: str, column: str, coltype: str):
 
 _ensure_column("users", "bio", "VARCHAR")
 _ensure_column("users", "interests", "VARCHAR")
+_ensure_column("users", "avatar", "TEXT")
 _ensure_column("users", "last_seen", "TIMESTAMP WITH TIME ZONE")
 
 
@@ -117,6 +105,7 @@ class UserOut(BaseModel):
     phone: Optional[str]
     bio: Optional[str]
     interests: Optional[str]
+    avatar: Optional[str]
     online: bool
 
     class Config:
@@ -129,8 +118,11 @@ class Token(BaseModel):
 
 
 class ProfileUpdate(BaseModel):
+    username: Optional[str] = None
     bio: Optional[str] = None
+    phone: Optional[str] = None
     interests: Optional[List[str]] = None
+    avatar: Optional[str] = None  # data URL or base64; None means "don't change"
 
 
 class DiscoverUser(BaseModel):
@@ -138,6 +130,7 @@ class DiscoverUser(BaseModel):
     username: str
     bio: Optional[str]
     interests: List[str]
+    avatar: Optional[str]
     online: bool
     shared_interests: List[str]
 
@@ -145,6 +138,7 @@ class DiscoverUser(BaseModel):
 class ConversationOut(BaseModel):
     user_id: int
     username: str
+    avatar: Optional[str]
     last_message: str
     last_timestamp: str
     online: bool
@@ -233,6 +227,27 @@ def is_online(user: User) -> bool:
     return delta.total_seconds() <= ONLINE_WINDOW_SECONDS
 
 
+def validate_avatar(avatar: Optional[str]) -> Optional[str]:
+    """Accepts a base64 data URL or raw base64. Returns normalized data URL."""
+    if avatar is None:
+        return None
+    if avatar == "":
+        return None
+    if len(avatar) > MAX_AVATAR_BYTES:
+        raise HTTPException(status_code=400, detail="Avatar too large")
+
+    # Already a data URL
+    if avatar.startswith("data:image/"):
+        return avatar
+
+    # Raw base64 — assume JPEG
+    try:
+        base64.b64decode(avatar, validate=True)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid base64 avatar")
+    return "data:image/jpeg;base64," + avatar
+
+
 # ---------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------
@@ -292,7 +307,7 @@ def login(form: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get
 def me(user: User = Depends(get_current_user)):
     return UserOut(
         id=user.id, username=user.username, email=user.email, phone=user.phone,
-        bio=user.bio, interests=user.interests, online=True,
+        bio=user.bio, interests=user.interests, avatar=user.avatar, online=True,
     )
 
 
@@ -300,15 +315,40 @@ def me(user: User = Depends(get_current_user)):
 def update_profile(data: ProfileUpdate,
                    user: User = Depends(get_current_user),
                    db: Session = Depends(get_db)):
+
+    if data.username is not None and data.username != user.username:
+        new_name = data.username.strip()
+        if not new_name:
+            raise HTTPException(status_code=400, detail="Username can't be empty")
+        if db.query(User).filter(User.username == new_name).first():
+            raise HTTPException(status_code=400, detail="Username already taken")
+        user.username = new_name
+
     if data.bio is not None:
         user.bio = data.bio
+
+    if data.phone is not None:
+        p = data.phone.strip()
+        if p == "":
+            user.phone = None
+        else:
+            # Phone uniqueness check
+            existing = db.query(User).filter(User.phone == p, User.id != user.id).first()
+            if existing:
+                raise HTTPException(status_code=400, detail="Phone already registered")
+            user.phone = p
+
     if data.interests is not None:
         user.interests = serialize_interests(data.interests)
+
+    if data.avatar is not None:
+        user.avatar = validate_avatar(data.avatar)
+
     db.commit()
     db.refresh(user)
     return UserOut(
         id=user.id, username=user.username, email=user.email, phone=user.phone,
-        bio=user.bio, interests=user.interests, online=True,
+        bio=user.bio, interests=user.interests, avatar=user.avatar, online=True,
     )
 
 
@@ -340,8 +380,10 @@ def discover(limit: int = 30,
     for u in pool[:limit]:
         theirs = parse_interests(u.interests)
         out.append(DiscoverUser(
-            id=u.id, username=u.username, bio=u.bio, interests=theirs,
-            online=is_online(u), shared_interests=list(my_interests & set(theirs)),
+            id=u.id, username=u.username, bio=u.bio,
+            interests=theirs, avatar=u.avatar,
+            online=is_online(u),
+            shared_interests=list(my_interests & set(theirs)),
         ))
     return out
 
@@ -358,8 +400,10 @@ def random_user(user: User = Depends(get_current_user),
     my_interests = set(parse_interests(user.interests))
     theirs = parse_interests(u.interests)
     return DiscoverUser(
-        id=u.id, username=u.username, bio=u.bio, interests=theirs,
-        online=is_online(u), shared_interests=list(my_interests & set(theirs)),
+        id=u.id, username=u.username, bio=u.bio,
+        interests=theirs, avatar=u.avatar,
+        online=is_online(u),
+        shared_interests=list(my_interests & set(theirs)),
     )
 
 
@@ -374,7 +418,9 @@ def search_users(q: str,
     return [
         {
             "id": u.id, "username": u.username, "bio": u.bio,
-            "interests": parse_interests(u.interests), "online": is_online(u),
+            "interests": parse_interests(u.interests),
+            "avatar": u.avatar,
+            "online": is_online(u),
         }
         for u in results
     ]
@@ -414,6 +460,7 @@ def conversations(user: User = Depends(get_current_user),
         out.append(ConversationOut(
             user_id=u.id,
             username=u.username,
+            avatar=u.avatar,
             last_message=content,
             last_timestamp=created_at.isoformat(),
             online=is_online(u),
@@ -468,9 +515,6 @@ def get_messages(other_user_id: int,
 def post_message(data: SendMessageIn,
                  user: User = Depends(get_current_user),
                  db: Session = Depends(get_db)):
-    """REST fallback for sending a message. WebSocket is preferred,
-    but this lets you test from /docs and gives the Android client
-    a reliable path if the WS ever drops."""
     if not data.content.strip():
         raise HTTPException(status_code=400, detail="Empty message")
     receiver = db.query(User).filter(User.id == data.to).first()
@@ -482,7 +526,6 @@ def post_message(data: SendMessageIn,
     db.commit()
     db.refresh(msg)
 
-    # best-effort push over WebSocket if recipient is online
     payload_out = {
         "id": msg.id,
         "from": user.id,
