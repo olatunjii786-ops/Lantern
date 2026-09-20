@@ -1,14 +1,6 @@
 """
 Lantern Backend — FastAPI + Neon Postgres + JWT + WebSockets
 Single-file backend for the Lantern chat app.
-
-Includes:
-- Auth (register, login, JWT)
-- Profile (avatar, bio, interests, phone, username)
-- Discover + search
-- Conversations + messages
-- Release/update system + admin panel
-- Bot account ("thegoodboy"): welcome, help, broadcast
 """
 
 import os
@@ -42,7 +34,7 @@ MAX_AVATAR_BYTES = 200_000
 BOT_USERNAME = "thegoodboy"
 BOT_DISPLAY = "Lantern Good Boy"
 BOT_BIO = "Your guide to Lantern. I welcome new users, post announcements, and answer app questions. I'm a bot — not a person. Type 'help' any time."
-BOT_PASSWORD = secrets.token_hex(32)  # nobody logs in as the bot
+BOT_PASSWORD = secrets.token_hex(32)
 
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL environment variable is required")
@@ -68,6 +60,12 @@ class User(Base):
     interests = Column(String, nullable=True)
     avatar = Column(Text, nullable=True)
     is_bot = Column(Boolean, default=False, nullable=False)
+
+    # Privacy toggles — default True (visible to others)
+    show_bio = Column(Boolean, default=True, nullable=False)
+    show_interests = Column(Boolean, default=True, nullable=False)
+    show_online = Column(Boolean, default=True, nullable=False)
+
     last_seen = Column(DateTime(timezone=True), server_default=func.now())
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
@@ -100,10 +98,13 @@ class Release(Base):
 Base.metadata.create_all(bind=engine)
 
 
-def _ensure_column(table: str, column: str, coltype: str):
+def _ensure_column(table: str, column: str, coltype: str, default: Optional[str] = None):
     with engine.begin() as conn:
         try:
-            conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}"))
+            ddl = f"ALTER TABLE {table} ADD COLUMN {column} {coltype}"
+            if default is not None:
+                ddl += f" DEFAULT {default}"
+            conn.execute(text(ddl))
         except Exception:
             pass
 
@@ -111,7 +112,10 @@ _ensure_column("users", "bio", "VARCHAR")
 _ensure_column("users", "interests", "VARCHAR")
 _ensure_column("users", "avatar", "TEXT")
 _ensure_column("users", "last_seen", "TIMESTAMP WITH TIME ZONE")
-_ensure_column("users", "is_bot", "BOOLEAN DEFAULT FALSE")
+_ensure_column("users", "is_bot", "BOOLEAN", "FALSE")
+_ensure_column("users", "show_bio", "BOOLEAN", "TRUE")
+_ensure_column("users", "show_interests", "BOOLEAN", "TRUE")
+_ensure_column("users", "show_online", "BOOLEAN", "TRUE")
 
 
 # ---------------------------------------------------------------------
@@ -123,12 +127,10 @@ def get_bot(db: Session) -> Optional[User]:
 
 
 def ensure_bot_exists():
-    """Create the bot account if it doesn't exist. Called at startup."""
     db = SessionLocal()
     try:
         existing = db.query(User).filter(User.username == BOT_USERNAME).first()
         if existing:
-            # Make sure is_bot is set even on old databases
             if not existing.is_bot:
                 existing.is_bot = True
                 db.commit()
@@ -140,6 +142,9 @@ def ensure_bot_exists():
             interests="",
             is_bot=True,
             last_seen=datetime.utcnow(),
+            show_bio=True,
+            show_interests=True,
+            show_online=True,
         )
         db.add(bot)
         db.commit()
@@ -148,8 +153,6 @@ def ensure_bot_exists():
 
 
 def send_bot_message(db: Session, receiver_id: int, content: str) -> Optional[Message]:
-    """Create and persist a message from the bot to a user.
-    Also best-effort pushes it over any active WebSocket for that user."""
     bot = get_bot(db)
     if not bot:
         return None
@@ -184,7 +187,6 @@ def bot_help_text() -> str:
 
 
 def bot_reply(db: Session, user: User, text: str) -> str:
-    """Return the bot's reply to a user message."""
     t = (text or "").strip().lower()
 
     if t in ("help", "hi", "hello", "hey", "start"):
@@ -244,7 +246,6 @@ def bot_reply(db: Session, user: User, text: str) -> str:
             "A good opener: mention something from their bio or a shared interest."
         )
 
-    # Fallback
     return (
         "I can't chat freely — I'm a bot for help and announcements only.\n\n"
         "Type 'help' to see what I can do."
@@ -273,10 +274,25 @@ class UserOut(BaseModel):
     interests: Optional[str]
     avatar: Optional[str]
     is_bot: bool
+    show_bio: bool
+    show_interests: bool
+    show_online: bool
     online: bool
 
     class Config:
         from_attributes = True
+
+
+class PublicUserOut(BaseModel):
+    """Profile card view of another user. Privacy already applied."""
+    id: int
+    username: str
+    avatar: Optional[str]
+    is_bot: bool
+    bio: Optional[str]           # None if hidden
+    interests: List[str]         # empty if hidden
+    online: Optional[bool]       # None if hidden
+    last_seen_text: Optional[str]  # e.g. "last seen 2h ago", None if hidden
 
 
 class Token(BaseModel):
@@ -290,6 +306,9 @@ class ProfileUpdate(BaseModel):
     phone: Optional[str] = None
     interests: Optional[List[str]] = None
     avatar: Optional[str] = None
+    show_bio: Optional[bool] = None
+    show_interests: Optional[bool] = None
+    show_online: Optional[bool] = None
 
 
 class DiscoverUser(BaseModel):
@@ -299,7 +318,8 @@ class DiscoverUser(BaseModel):
     interests: List[str]
     avatar: Optional[str]
     is_bot: bool
-    online: bool
+    online: Optional[bool]
+    last_seen_text: Optional[str]
     shared_interests: List[str]
 
 
@@ -310,7 +330,8 @@ class ConversationOut(BaseModel):
     is_bot: bool
     last_message: str
     last_timestamp: str
-    online: bool
+    online: Optional[bool]
+    last_seen_text: Optional[str]
 
 
 class SendMessageIn(BaseModel):
@@ -426,6 +447,26 @@ def is_online(user: User) -> bool:
     return delta.total_seconds() <= ONLINE_WINDOW_SECONDS
 
 
+def humanize_last_seen(user: User) -> str:
+    """Return 'just now', '5m ago', '2h ago', 'yesterday', '3d ago', etc."""
+    if user.is_bot:
+        return "online"
+    if not user.last_seen:
+        return "a long time ago"
+    delta = datetime.utcnow() - user.last_seen.replace(tzinfo=None)
+    secs = int(delta.total_seconds())
+
+    if secs < 60:
+        return "just now"
+    if secs < 3600:
+        return f"{secs // 60}m ago"
+    if secs < 86400:
+        return f"{secs // 3600}h ago"
+    if secs < 172800:
+        return "yesterday"
+    return f"{secs // 86400}d ago"
+
+
 def validate_avatar(avatar: Optional[str]) -> Optional[str]:
     if avatar is None:
         return None
@@ -440,6 +481,26 @@ def validate_avatar(avatar: Optional[str]) -> Optional[str]:
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid base64 avatar")
     return "data:image/jpeg;base64," + avatar
+
+
+def public_view_of(user: User) -> PublicUserOut:
+    """Apply the user's own privacy settings before exposing to others."""
+    if user.is_bot:
+        return PublicUserOut(
+            id=user.id, username=user.username, avatar=user.avatar,
+            is_bot=True, bio=user.bio or "", interests=[],
+            online=True, last_seen_text="online",
+        )
+    return PublicUserOut(
+        id=user.id,
+        username=user.username,
+        avatar=user.avatar,
+        is_bot=False,
+        bio=(user.bio or "") if user.show_bio else None,
+        interests=parse_interests(user.interests) if user.show_interests else [],
+        online=is_online(user) if user.show_online else None,
+        last_seen_text=humanize_last_seen(user) if user.show_online else None,
+    )
 
 
 # ---------------------------------------------------------------------
@@ -487,16 +548,18 @@ def register(data: UserCreate, db: Session = Depends(get_db)):
         interests=serialize_interests(data.interests),
         last_seen=datetime.utcnow(),
         is_bot=False,
+        show_bio=True,
+        show_interests=True,
+        show_online=True,
     )
     db.add(user)
     db.commit()
     db.refresh(user)
 
-    # Send the welcome from the bot immediately
     try:
         send_bot_message(db, user.id, bot_welcome_text(user.username))
     except Exception:
-        pass  # never block registration on bot failure
+        pass
 
     return Token(access_token=create_access_token(user.id, user.username))
 
@@ -520,7 +583,9 @@ def me(user: User = Depends(get_current_user)):
     return UserOut(
         id=user.id, username=user.username, email=user.email, phone=user.phone,
         bio=user.bio, interests=user.interests, avatar=user.avatar,
-        is_bot=user.is_bot, online=True,
+        is_bot=user.is_bot,
+        show_bio=user.show_bio, show_interests=user.show_interests, show_online=user.show_online,
+        online=True,
     )
 
 
@@ -560,17 +625,26 @@ def update_profile(data: ProfileUpdate,
     if data.avatar is not None:
         user.avatar = validate_avatar(data.avatar)
 
+    if data.show_bio is not None:
+        user.show_bio = bool(data.show_bio)
+    if data.show_interests is not None:
+        user.show_interests = bool(data.show_interests)
+    if data.show_online is not None:
+        user.show_online = bool(data.show_online)
+
     db.commit()
     db.refresh(user)
     return UserOut(
         id=user.id, username=user.username, email=user.email, phone=user.phone,
         bio=user.bio, interests=user.interests, avatar=user.avatar,
-        is_bot=user.is_bot, online=True,
+        is_bot=user.is_bot,
+        show_bio=user.show_bio, show_interests=user.show_interests, show_online=user.show_online,
+        online=True,
     )
 
 
 # ---------------------------------------------------------------------
-# Discover
+# Discover / Users
 # ---------------------------------------------------------------------
 
 @app.get("/users/discover", response_model=List[DiscoverUser])
@@ -580,13 +654,13 @@ def discover(limit: int = 30,
     my_interests = set(parse_interests(user.interests))
     pool = (db.query(User)
             .filter(User.id != user.id)
-            .filter(User.is_bot == False)  # bots don't show in Discover
+            .filter(User.is_bot == False)
             .order_by(User.last_seen.desc().nullslast())
             .limit(200)
             .all())
 
     def score(u: User):
-        theirs = set(parse_interests(u.interests))
+        theirs = set(parse_interests(u.interests)) if u.show_interests else set()
         s = len(my_interests & theirs) * 10
         if is_online(u):
             s += 5
@@ -596,12 +670,15 @@ def discover(limit: int = 30,
 
     out = []
     for u in pool[:limit]:
-        theirs = parse_interests(u.interests)
+        theirs = parse_interests(u.interests) if u.show_interests else []
         out.append(DiscoverUser(
-            id=u.id, username=u.username, bio=u.bio,
-            interests=theirs, avatar=u.avatar,
+            id=u.id, username=u.username,
+            bio=(u.bio if u.show_bio else None),
+            interests=theirs,
+            avatar=u.avatar,
             is_bot=u.is_bot,
-            online=is_online(u),
+            online=(is_online(u) if u.show_online else None),
+            last_seen_text=(humanize_last_seen(u) if u.show_online else None),
             shared_interests=list(my_interests & set(theirs)),
         ))
     return out
@@ -618,12 +695,15 @@ def random_user(user: User = Depends(get_current_user),
     if not u:
         return None
     my_interests = set(parse_interests(user.interests))
-    theirs = parse_interests(u.interests)
+    theirs = parse_interests(u.interests) if u.show_interests else []
     return DiscoverUser(
-        id=u.id, username=u.username, bio=u.bio,
-        interests=theirs, avatar=u.avatar,
+        id=u.id, username=u.username,
+        bio=(u.bio if u.show_bio else None),
+        interests=theirs,
+        avatar=u.avatar,
         is_bot=u.is_bot,
-        online=is_online(u),
+        online=(is_online(u) if u.show_online else None),
+        last_seen_text=(humanize_last_seen(u) if u.show_online else None),
         shared_interests=list(my_interests & set(theirs)),
     )
 
@@ -637,21 +717,22 @@ def search_users(q: str,
                .filter(User.id != user.id)
                .filter(User.is_bot == False)
                .limit(20).all())
-    return [
-        {
-            "id": u.id, "username": u.username, "bio": u.bio,
-            "interests": parse_interests(u.interests),
+    out = []
+    for u in results:
+        out.append({
+            "id": u.id, "username": u.username,
+            "bio": (u.bio if u.show_bio else None),
+            "interests": (parse_interests(u.interests) if u.show_interests else []),
             "avatar": u.avatar,
             "is_bot": u.is_bot,
-            "online": is_online(u),
-        }
-        for u in results
-    ]
+            "online": (is_online(u) if u.show_online else None),
+            "last_seen_text": (humanize_last_seen(u) if u.show_online else None),
+        })
+    return out
 
 
 @app.get("/users/bot")
 def get_bot_info(db: Session = Depends(get_db)):
-    """Public endpoint: the bot's ID and profile so the client can find it."""
     bot = get_bot(db)
     if not bot:
         raise HTTPException(status_code=404, detail="Bot not found")
@@ -662,6 +743,27 @@ def get_bot_info(db: Session = Depends(get_db)):
         "avatar": bot.avatar,
         "is_bot": True,
     }
+
+
+@app.get("/users/{user_id}", response_model=PublicUserOut)
+def get_public_user(user_id: int,
+                    user: User = Depends(get_current_user),
+                    db: Session = Depends(get_db)):
+    """Full profile card of another user. Privacy applied."""
+    target = db.query(User).filter(User.id == user_id).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    # Your own profile is fully visible
+    if target.id == user.id:
+        return PublicUserOut(
+            id=target.id, username=target.username, avatar=target.avatar,
+            is_bot=target.is_bot,
+            bio=target.bio or "",
+            interests=parse_interests(target.interests),
+            online=True,
+            last_seen_text="just now",
+        )
+    return public_view_of(target)
 
 
 # ---------------------------------------------------------------------
@@ -702,7 +804,8 @@ def conversations(user: User = Depends(get_current_user),
             is_bot=u.is_bot,
             last_message=content,
             last_timestamp=created_at.isoformat(),
-            online=is_online(u),
+            online=(is_online(u) if (u.is_bot or u.show_online) else None),
+            last_seen_text=(humanize_last_seen(u) if (u.is_bot or u.show_online) else None),
         ))
     return out
 
@@ -711,7 +814,6 @@ def conversations(user: User = Depends(get_current_user),
 def delete_conversation(other_user_id: int,
                         user: User = Depends(get_current_user),
                         db: Session = Depends(get_db)):
-    # Users cannot delete the bot chat — it's their onboarding channel
     other = db.query(User).filter(User.id == other_user_id).first()
     if other and other.is_bot:
         raise HTTPException(status_code=403, detail="You can't delete the bot chat")
@@ -785,7 +887,6 @@ def post_message(data: SendMessageIn,
     except Exception:
         pass
 
-    # If the recipient is the bot, generate a reply
     if receiver.is_bot:
         try:
             reply_text = bot_reply(db, user, data.content.strip())
@@ -913,7 +1014,7 @@ def admin_delete_release(version_code: int,
 
 
 # ---------------------------------------------------------------------
-# Broadcast (admin → bot → all users)
+# Broadcast
 # ---------------------------------------------------------------------
 
 @app.post("/admin/broadcast")
@@ -1052,8 +1153,8 @@ ADMIN_HTML = """<!DOCTYPE html>
   </div>
 
   <div class="tabs">
-    <button class="tab active" onclick="switchTab('releases')">Releases</button>
-    <button class="tab" onclick="switchTab('broadcast')">Broadcast</button>
+    <button class="tab active" onclick="switchTab('releases', event)">Releases</button>
+    <button class="tab" onclick="switchTab('broadcast', event)">Broadcast</button>
   </div>
 
   <div class="pane active" id="pane-releases">
@@ -1096,7 +1197,6 @@ ADMIN_HTML = """<!DOCTYPE html>
       <h3 style="margin-top:0;font-size:15px;font-weight:500">Send a broadcast</h3>
       <div class="sub" style="margin-bottom:16px">
         This sends a message from the Lantern Good Boy bot to every user.
-        It appears in their bot chat and triggers a notification.
       </div>
       <div class="field">
         <label>Message</label>
@@ -1121,11 +1221,11 @@ function toast(msg) {
   setTimeout(() => t.classList.remove('show'), 2500);
 }
 
-function switchTab(name) {
+function switchTab(name, ev) {
   document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
   document.querySelectorAll('.pane').forEach(p => p.classList.remove('active'));
   document.getElementById('pane-' + name).classList.add('active');
-  event.target.classList.add('active');
+  if (ev && ev.target) ev.target.classList.add('active');
 }
 
 function onKeyInput() {
@@ -1286,7 +1386,6 @@ async function sendBroadcast() {
   }
 }
 
-// Auto-fill key from ?key= in URL
 (function() {
   const params = new URLSearchParams(window.location.search);
   const k = params.get('key');
@@ -1386,7 +1485,6 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
             await manager.send_to(user_id, payload_out)
             await manager.send_to(receiver_id, payload_out)
 
-            # If the message went to the bot, generate a reply
             if receiver.is_bot:
                 try:
                     reply_text = bot_reply(db, u, content)
