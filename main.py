@@ -61,7 +61,6 @@ class User(Base):
     avatar = Column(Text, nullable=True)
     is_bot = Column(Boolean, default=False, nullable=False)
 
-    # Privacy toggles — default True (visible to others)
     show_bio = Column(Boolean, default=True, nullable=False)
     show_interests = Column(Boolean, default=True, nullable=False)
     show_online = Column(Boolean, default=True, nullable=False)
@@ -284,15 +283,14 @@ class UserOut(BaseModel):
 
 
 class PublicUserOut(BaseModel):
-    """Profile card view of another user. Privacy already applied."""
     id: int
     username: str
     avatar: Optional[str]
     is_bot: bool
-    bio: Optional[str]           # None if hidden
-    interests: List[str]         # empty if hidden
-    online: Optional[bool]       # None if hidden
-    last_seen_text: Optional[str]  # e.g. "last seen 2h ago", None if hidden
+    bio: Optional[str]
+    interests: List[str]
+    online: Optional[bool]
+    last_seen_text: Optional[str]
 
 
 class Token(BaseModel):
@@ -448,7 +446,6 @@ def is_online(user: User) -> bool:
 
 
 def humanize_last_seen(user: User) -> str:
-    """Return 'just now', '5m ago', '2h ago', 'yesterday', '3d ago', etc."""
     if user.is_bot:
         return "online"
     if not user.last_seen:
@@ -484,7 +481,6 @@ def validate_avatar(avatar: Optional[str]) -> Optional[str]:
 
 
 def public_view_of(user: User) -> PublicUserOut:
-    """Apply the user's own privacy settings before exposing to others."""
     if user.is_bot:
         return PublicUserOut(
             id=user.id, username=user.username, avatar=user.avatar,
@@ -749,11 +745,9 @@ def get_bot_info(db: Session = Depends(get_db)):
 def get_public_user(user_id: int,
                     user: User = Depends(get_current_user),
                     db: Session = Depends(get_db)):
-    """Full profile card of another user. Privacy applied."""
     target = db.query(User).filter(User.id == user_id).first()
     if not target:
         raise HTTPException(status_code=404, detail="User not found")
-    # Your own profile is fully visible
     if target.id == user.id:
         return PublicUserOut(
             id=target.id, username=target.username, avatar=target.avatar,
@@ -1060,31 +1054,6 @@ def admin_broadcast(data: BroadcastIn,
 # ---------------------------------------------------------------------
 # Admin panel
 # ---------------------------------------------------------------------
-
-@app.post("/admin/self-test")
-async def admin_self_test(x_admin_key: Optional[str] = Header(None),
-                          db: Session = Depends(get_db)):
-    """DEBUG: send a message from the bot to every logged-in user's WS."""
-    require_admin(x_admin_key)
-    bot = get_bot(db)
-    if not bot:
-        raise HTTPException(status_code=500, detail="Bot missing")
-
-    results = {}
-    for uid, ws in list(manager.active.items()):
-        try:
-            await ws.send_json({
-                "id": -1,
-                "from": bot.id,
-                "from_username": BOT_USERNAME,
-                "to": uid,
-                "content": "DEBUG self-test ping",
-                "created_at": datetime.utcnow().isoformat(),
-            })
-            results[uid] = "sent"
-        except Exception as e:
-            results[uid] = f"failed: {e}"
-    return {"active_connections": list(manager.active.keys()), "results": results}
 
 ADMIN_HTML = """<!DOCTYPE html>
 <html lang="en">
@@ -1435,23 +1404,38 @@ def admin_panel():
 # ---------------------------------------------------------------------
 
 class ConnectionManager:
+    """
+    Holds WebSocket connections per user. A single user can have multiple
+    live connections (e.g., one from the foreground activity, one from
+    the background service). All of them get every message.
+    """
     def __init__(self):
-        self.active: dict[int, WebSocket] = {}
+        self.active: dict[int, set[WebSocket]] = {}
 
     async def connect(self, user_id: int, websocket: WebSocket):
         await websocket.accept()
-        self.active[user_id] = websocket
+        if user_id not in self.active:
+            self.active[user_id] = set()
+        self.active[user_id].add(websocket)
 
-    def disconnect(self, user_id: int):
-        self.active.pop(user_id, None)
+    def disconnect(self, user_id: int, websocket: WebSocket):
+        if user_id in self.active:
+            self.active[user_id].discard(websocket)
+            if not self.active[user_id]:
+                del self.active[user_id]
 
     async def send_to(self, user_id: int, message: dict):
-        ws = self.active.get(user_id)
-        if ws:
+        sockets = self.active.get(user_id)
+        if not sockets:
+            return
+        dead = []
+        for ws in list(sockets):
             try:
                 await ws.send_json(message)
             except Exception:
-                self.disconnect(user_id)
+                dead.append(ws)
+        for ws in dead:
+            self.disconnect(user_id, ws)
 
 
 manager = ConnectionManager()
@@ -1528,9 +1512,9 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
                     pass
 
     except WebSocketDisconnect:
-        manager.disconnect(user_id)
+        manager.disconnect(user_id, websocket)
     except Exception:
-        manager.disconnect(user_id)
+        manager.disconnect(user_id, websocket)
     finally:
         db.close()
 
