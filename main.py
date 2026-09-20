@@ -1055,48 +1055,60 @@ def admin_broadcast(data: BroadcastIn,
 # Admin panel
 # ---------------------------------------------------------------------
 
-# ---------------------------------------------------------------------
-# Admin — connection diagnostic
-# ---------------------------------------------------------------------
-
 @app.post("/admin/test-delivery")
 async def admin_test_delivery(x_admin_key: Optional[str] = Header(None),
                               db: Session = Depends(get_db)):
     """
-    Sends a diagnostic message from the bot to every WebSocket
-    currently connected for the requesting admin's own user ID.
-    Use this to verify that live delivery is working.
+    Sends a *stored* diagnostic message from the bot to every user
+    with an active WebSocket. Behaves exactly like a real incoming
+    message — it's saved to the DB, delivered over WS, and will
+    appear in the chat when opened.
     """
     require_admin(x_admin_key)
     bot = get_bot(db)
     if not bot:
         raise HTTPException(status_code=500, detail="Bot missing")
 
-    # Send to every user that has an active socket
     report = {}
-    for uid, sockets in list(manager.active.items()):
-        ok = 0
-        fail = 0
-        for ws in list(sockets):
-            try:
-                await ws.send_json({
-                    "id": -1,
-                    "from": bot.id,
-                    "from_username": BOT_USERNAME,
-                    "to": uid,
-                    "content": "Diagnostic ping — this proves live delivery works.",
-                    "created_at": datetime.utcnow().isoformat(),
-                })
-                ok += 1
-            except Exception:
-                fail += 1
-                manager.disconnect(uid, ws)
-        report[uid] = {"delivered": ok, "failed": fail}
+    for uid in list(manager.active.keys()):
+        try:
+            # Save the message exactly like a real one
+            msg = Message(
+                sender_id=bot.id,
+                receiver_id=uid,
+                content="Diagnostic ping — this is a real stored message."
+            )
+            db.add(msg)
+            db.commit()
+            db.refresh(msg)
+
+            payload = {
+                "id": msg.id,
+                "from": bot.id,
+                "from_username": BOT_USERNAME,
+                "to": uid,
+                "content": msg.content,
+                "created_at": msg.created_at.isoformat(),
+            }
+
+            # Deliver to every active socket for this user
+            sockets = manager.active.get(uid, set())
+            delivered = 0
+            for ws in list(sockets):
+                try:
+                    await ws.send_json(payload)
+                    delivered += 1
+                except Exception:
+                    manager.disconnect(uid, ws)
+
+            report[uid] = {"stored": msg.id, "delivered": delivered}
+        except Exception as e:
+            report[uid] = {"error": str(e)}
 
     return {
         "active_user_ids": list(manager.active.keys()),
         "sockets_per_user": {uid: len(s) for uid, s in manager.active.items()},
-        "delivery_report": report,
+        "report": report,
     }
 
 ADMIN_HTML = """<!DOCTYPE html>
