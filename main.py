@@ -1061,6 +1061,31 @@ def admin_broadcast(data: BroadcastIn,
 # Admin panel
 # ---------------------------------------------------------------------
 
+@app.post("/admin/self-test")
+async def admin_self_test(x_admin_key: Optional[str] = Header(None),
+                          db: Session = Depends(get_db)):
+    """DEBUG: send a message from the bot to every logged-in user's WS."""
+    require_admin(x_admin_key)
+    bot = get_bot(db)
+    if not bot:
+        raise HTTPException(status_code=500, detail="Bot missing")
+
+    results = {}
+    for uid, ws in list(manager.active.items()):
+        try:
+            await ws.send_json({
+                "id": -1,
+                "from": bot.id,
+                "from_username": BOT_USERNAME,
+                "to": uid,
+                "content": "DEBUG self-test ping",
+                "created_at": datetime.utcnow().isoformat(),
+            })
+            results[uid] = "sent"
+        except Exception as e:
+            results[uid] = f"failed: {e}"
+    return {"active_connections": list(manager.active.keys()), "results": results}
+
 ADMIN_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
