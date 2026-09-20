@@ -1055,6 +1055,50 @@ def admin_broadcast(data: BroadcastIn,
 # Admin panel
 # ---------------------------------------------------------------------
 
+# ---------------------------------------------------------------------
+# Admin — connection diagnostic
+# ---------------------------------------------------------------------
+
+@app.post("/admin/test-delivery")
+async def admin_test_delivery(x_admin_key: Optional[str] = Header(None),
+                              db: Session = Depends(get_db)):
+    """
+    Sends a diagnostic message from the bot to every WebSocket
+    currently connected for the requesting admin's own user ID.
+    Use this to verify that live delivery is working.
+    """
+    require_admin(x_admin_key)
+    bot = get_bot(db)
+    if not bot:
+        raise HTTPException(status_code=500, detail="Bot missing")
+
+    # Send to every user that has an active socket
+    report = {}
+    for uid, sockets in list(manager.active.items()):
+        ok = 0
+        fail = 0
+        for ws in list(sockets):
+            try:
+                await ws.send_json({
+                    "id": -1,
+                    "from": bot.id,
+                    "from_username": BOT_USERNAME,
+                    "to": uid,
+                    "content": "Diagnostic ping — this proves live delivery works.",
+                    "created_at": datetime.utcnow().isoformat(),
+                })
+                ok += 1
+            except Exception:
+                fail += 1
+                manager.disconnect(uid, ws)
+        report[uid] = {"delivered": ok, "failed": fail}
+
+    return {
+        "active_user_ids": list(manager.active.keys()),
+        "sockets_per_user": {uid: len(s) for uid, s in manager.active.items()},
+        "delivery_report": report,
+    }
+
 ADMIN_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
