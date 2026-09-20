@@ -1,6 +1,14 @@
 """
 Lantern Backend — FastAPI + Neon Postgres + JWT + WebSockets
 Single-file backend for the Lantern chat app.
+
+Includes:
+- Auth (register, login, JWT)
+- Profile (avatar, bio, interests, phone, username)
+- Discover + search
+- Conversations + messages
+- Release/update system + admin panel
+- Bot account ("thegoodboy"): welcome, help, broadcast
 """
 
 import os
@@ -11,7 +19,7 @@ from typing import Optional, List
 
 import bcrypt
 from jose import jwt, JWTError
-from fastapi import FastAPI, Depends, HTTPException, WebSocket, WebSocketDisconnect, Query, Header, Request
+from fastapi import FastAPI, Depends, HTTPException, WebSocket, WebSocketDisconnect, Query, Header
 from fastapi.responses import HTMLResponse
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel, EmailStr
@@ -30,6 +38,11 @@ ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7
 ONLINE_WINDOW_SECONDS = 300
 MAX_AVATAR_BYTES = 200_000
+
+BOT_USERNAME = "thegoodboy"
+BOT_DISPLAY = "Lantern Good Boy"
+BOT_BIO = "Your guide to Lantern. I welcome new users, post announcements, and answer app questions. I'm a bot — not a person. Type 'help' any time."
+BOT_PASSWORD = secrets.token_hex(32)  # nobody logs in as the bot
 
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL environment variable is required")
@@ -54,6 +67,7 @@ class User(Base):
     bio = Column(String, nullable=True)
     interests = Column(String, nullable=True)
     avatar = Column(Text, nullable=True)
+    is_bot = Column(Boolean, default=False, nullable=False)
     last_seen = Column(DateTime(timezone=True), server_default=func.now())
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
@@ -97,6 +111,144 @@ _ensure_column("users", "bio", "VARCHAR")
 _ensure_column("users", "interests", "VARCHAR")
 _ensure_column("users", "avatar", "TEXT")
 _ensure_column("users", "last_seen", "TIMESTAMP WITH TIME ZONE")
+_ensure_column("users", "is_bot", "BOOLEAN DEFAULT FALSE")
+
+
+# ---------------------------------------------------------------------
+# Bot helpers
+# ---------------------------------------------------------------------
+
+def get_bot(db: Session) -> Optional[User]:
+    return db.query(User).filter(User.username == BOT_USERNAME).first()
+
+
+def ensure_bot_exists():
+    """Create the bot account if it doesn't exist. Called at startup."""
+    db = SessionLocal()
+    try:
+        existing = db.query(User).filter(User.username == BOT_USERNAME).first()
+        if existing:
+            # Make sure is_bot is set even on old databases
+            if not existing.is_bot:
+                existing.is_bot = True
+                db.commit()
+            return
+        bot = User(
+            username=BOT_USERNAME,
+            hashed_password=bcrypt.hashpw(BOT_PASSWORD.encode(), bcrypt.gensalt()).decode(),
+            bio=BOT_BIO,
+            interests="",
+            is_bot=True,
+            last_seen=datetime.utcnow(),
+        )
+        db.add(bot)
+        db.commit()
+    finally:
+        db.close()
+
+
+def send_bot_message(db: Session, receiver_id: int, content: str) -> Optional[Message]:
+    """Create and persist a message from the bot to a user.
+    Also best-effort pushes it over any active WebSocket for that user."""
+    bot = get_bot(db)
+    if not bot:
+        return None
+    msg = Message(sender_id=bot.id, receiver_id=receiver_id, content=content)
+    db.add(msg)
+    db.commit()
+    db.refresh(msg)
+    return msg
+
+
+def bot_welcome_text(username: str) -> str:
+    return (
+        f"Hey {username} 👋 I'm Lantern Good Boy — the app's bot.\n\n"
+        "I'm not a person, but I'm here to help.\n\n"
+        "• Tap Discover to find real people to chat with.\n"
+        "• Type 'help' any time to see what I can do.\n\n"
+        "Good luck out there."
+    )
+
+
+def bot_help_text() -> str:
+    return (
+        "Here's what I can help with. Just type one of these words:\n\n"
+        "• profile — how to change your name, photo, or bio\n"
+        "• delete — how to delete a message or a whole chat\n"
+        "• notifications — how to control alerts\n"
+        "• update — how to get the latest version\n"
+        "• privacy — what this app stores about you\n"
+        "• discover — how to find people to talk to\n\n"
+        "I can't chat freely — I'm just here to help and share announcements."
+    )
+
+
+def bot_reply(db: Session, user: User, text: str) -> str:
+    """Return the bot's reply to a user message."""
+    t = (text or "").strip().lower()
+
+    if t in ("help", "hi", "hello", "hey", "start"):
+        return bot_help_text()
+
+    if "profile" in t or "photo" in t or "avatar" in t or "bio" in t:
+        return (
+            "To edit your profile:\n\n"
+            "1. Go to the Chats tab\n"
+            "2. Tap 'Profile' at the top right\n"
+            "3. Change your photo, username, bio, or interests\n"
+            "4. Tap 'Save changes'\n\n"
+            "Your avatar is what other users see next to your name."
+        )
+
+    if "delete" in t:
+        return (
+            "To delete things:\n\n"
+            "• One message: long-press the bubble in a chat, tap Delete\n"
+            "• A whole chat: long-press the person's row on the Chats tab, tap Delete\n\n"
+            "Deleted messages are removed from both sides."
+        )
+
+    if "notification" in t or "alert" in t or "sound" in t:
+        return (
+            "Notifications:\n\n"
+            "• Lantern uses a background service to keep you connected\n"
+            "• If you don't want notifications, open your phone's Settings, find Lantern, and turn off its notifications\n"
+            "• You'll still receive messages, you just won't be alerted"
+        )
+
+    if "update" in t or "version" in t:
+        return (
+            "To update Lantern:\n\n"
+            "• When a new version is live, the app shows a dialog with an Update button\n"
+            "• Tap Update and install the new version\n"
+            "• Your account, chats, and profile all carry over — nothing is lost\n\n"
+            "Some updates are required; you'll be told when they are."
+        )
+
+    if "privacy" in t or "data" in t or "safe" in t:
+        return (
+            "What Lantern stores:\n\n"
+            "• Your username, and email or phone (whichever you gave)\n"
+            "• Your avatar, bio, and interests\n"
+            "• Your messages — only visible to you and the person you sent them to\n\n"
+            "The bot only sees messages you send directly to me. "
+            "I never read your other chats."
+        )
+
+    if "discover" in t or "find" in t or "people" in t or "meet" in t:
+        return (
+            "To find people:\n\n"
+            "• Tap Discover — you'll see users ranked by shared interests\n"
+            "• Tap the search bar to filter by username, bio, or interest\n"
+            "• Or tap the ＋ button on the Chats tab to search by exact username\n\n"
+            "A good opener: mention something from their bio or a shared interest."
+        )
+
+    # Fallback
+    return (
+        "I can't chat freely — I'm a bot for help and announcements only.\n\n"
+        "Type 'help' to see what I can do."
+    )
 
 
 # ---------------------------------------------------------------------
@@ -120,6 +272,7 @@ class UserOut(BaseModel):
     bio: Optional[str]
     interests: Optional[str]
     avatar: Optional[str]
+    is_bot: bool
     online: bool
 
     class Config:
@@ -145,6 +298,7 @@ class DiscoverUser(BaseModel):
     bio: Optional[str]
     interests: List[str]
     avatar: Optional[str]
+    is_bot: bool
     online: bool
     shared_interests: List[str]
 
@@ -153,6 +307,7 @@ class ConversationOut(BaseModel):
     user_id: int
     username: str
     avatar: Optional[str]
+    is_bot: bool
     last_message: str
     last_timestamp: str
     online: bool
@@ -186,6 +341,10 @@ class ReleaseOut(BaseModel):
     notes: str
     blocking: bool
     published_at: str
+
+
+class BroadcastIn(BaseModel):
+    content: str
 
 
 # ---------------------------------------------------------------------
@@ -259,6 +418,8 @@ def serialize_interests(tags: Optional[List[str]]) -> Optional[str]:
 
 
 def is_online(user: User) -> bool:
+    if user.is_bot:
+        return True
     if not user.last_seen:
         return False
     delta = datetime.utcnow() - user.last_seen.replace(tzinfo=None)
@@ -288,6 +449,11 @@ def validate_avatar(avatar: Optional[str]) -> Optional[str]:
 app = FastAPI(title="Lantern Backend")
 
 
+@app.on_event("startup")
+def on_startup():
+    ensure_bot_exists()
+
+
 @app.get("/")
 def root():
     return {"app": "Lantern", "status": "running"}
@@ -301,6 +467,9 @@ def root():
 def register(data: UserCreate, db: Session = Depends(get_db)):
     if not data.email and not data.phone:
         raise HTTPException(status_code=400, detail="Provide either email or phone")
+
+    if data.username.lower() == BOT_USERNAME:
+        raise HTTPException(status_code=400, detail="That username is reserved")
 
     if db.query(User).filter(User.username == data.username).first():
         raise HTTPException(status_code=400, detail="Username already taken")
@@ -317,10 +486,18 @@ def register(data: UserCreate, db: Session = Depends(get_db)):
         bio=data.bio,
         interests=serialize_interests(data.interests),
         last_seen=datetime.utcnow(),
+        is_bot=False,
     )
     db.add(user)
     db.commit()
     db.refresh(user)
+
+    # Send the welcome from the bot immediately
+    try:
+        send_bot_message(db, user.id, bot_welcome_text(user.username))
+    except Exception:
+        pass  # never block registration on bot failure
+
     return Token(access_token=create_access_token(user.id, user.username))
 
 
@@ -331,6 +508,8 @@ def login(form: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get
     ).first()
     if not user or not verify_password(form.password, user.hashed_password):
         raise HTTPException(status_code=401, detail="Invalid credentials")
+    if user.is_bot:
+        raise HTTPException(status_code=403, detail="Not a user account")
     user.last_seen = datetime.utcnow()
     db.commit()
     return Token(access_token=create_access_token(user.id, user.username))
@@ -340,7 +519,8 @@ def login(form: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get
 def me(user: User = Depends(get_current_user)):
     return UserOut(
         id=user.id, username=user.username, email=user.email, phone=user.phone,
-        bio=user.bio, interests=user.interests, avatar=user.avatar, online=True,
+        bio=user.bio, interests=user.interests, avatar=user.avatar,
+        is_bot=user.is_bot, online=True,
     )
 
 
@@ -348,11 +528,15 @@ def me(user: User = Depends(get_current_user)):
 def update_profile(data: ProfileUpdate,
                    user: User = Depends(get_current_user),
                    db: Session = Depends(get_db)):
+    if user.is_bot:
+        raise HTTPException(status_code=403, detail="Cannot modify bot account")
 
     if data.username is not None and data.username != user.username:
         new_name = data.username.strip()
         if not new_name:
             raise HTTPException(status_code=400, detail="Username can't be empty")
+        if new_name.lower() == BOT_USERNAME:
+            raise HTTPException(status_code=400, detail="That username is reserved")
         if db.query(User).filter(User.username == new_name).first():
             raise HTTPException(status_code=400, detail="Username already taken")
         user.username = new_name
@@ -380,7 +564,8 @@ def update_profile(data: ProfileUpdate,
     db.refresh(user)
     return UserOut(
         id=user.id, username=user.username, email=user.email, phone=user.phone,
-        bio=user.bio, interests=user.interests, avatar=user.avatar, online=True,
+        bio=user.bio, interests=user.interests, avatar=user.avatar,
+        is_bot=user.is_bot, online=True,
     )
 
 
@@ -395,6 +580,7 @@ def discover(limit: int = 30,
     my_interests = set(parse_interests(user.interests))
     pool = (db.query(User)
             .filter(User.id != user.id)
+            .filter(User.is_bot == False)  # bots don't show in Discover
             .order_by(User.last_seen.desc().nullslast())
             .limit(200)
             .all())
@@ -414,6 +600,7 @@ def discover(limit: int = 30,
         out.append(DiscoverUser(
             id=u.id, username=u.username, bio=u.bio,
             interests=theirs, avatar=u.avatar,
+            is_bot=u.is_bot,
             online=is_online(u),
             shared_interests=list(my_interests & set(theirs)),
         ))
@@ -425,6 +612,7 @@ def random_user(user: User = Depends(get_current_user),
                 db: Session = Depends(get_db)):
     u = (db.query(User)
          .filter(User.id != user.id)
+         .filter(User.is_bot == False)
          .order_by(func.random())
          .first())
     if not u:
@@ -434,6 +622,7 @@ def random_user(user: User = Depends(get_current_user),
     return DiscoverUser(
         id=u.id, username=u.username, bio=u.bio,
         interests=theirs, avatar=u.avatar,
+        is_bot=u.is_bot,
         online=is_online(u),
         shared_interests=list(my_interests & set(theirs)),
     )
@@ -446,16 +635,33 @@ def search_users(q: str,
     results = (db.query(User)
                .filter(User.username.ilike(f"%{q}%"))
                .filter(User.id != user.id)
+               .filter(User.is_bot == False)
                .limit(20).all())
     return [
         {
             "id": u.id, "username": u.username, "bio": u.bio,
             "interests": parse_interests(u.interests),
             "avatar": u.avatar,
+            "is_bot": u.is_bot,
             "online": is_online(u),
         }
         for u in results
     ]
+
+
+@app.get("/users/bot")
+def get_bot_info(db: Session = Depends(get_db)):
+    """Public endpoint: the bot's ID and profile so the client can find it."""
+    bot = get_bot(db)
+    if not bot:
+        raise HTTPException(status_code=404, detail="Bot not found")
+    return {
+        "id": bot.id,
+        "username": bot.username,
+        "bio": bot.bio,
+        "avatar": bot.avatar,
+        "is_bot": True,
+    }
 
 
 # ---------------------------------------------------------------------
@@ -493,6 +699,7 @@ def conversations(user: User = Depends(get_current_user),
             user_id=u.id,
             username=u.username,
             avatar=u.avatar,
+            is_bot=u.is_bot,
             last_message=content,
             last_timestamp=created_at.isoformat(),
             online=is_online(u),
@@ -504,6 +711,11 @@ def conversations(user: User = Depends(get_current_user),
 def delete_conversation(other_user_id: int,
                         user: User = Depends(get_current_user),
                         db: Session = Depends(get_db)):
+    # Users cannot delete the bot chat — it's their onboarding channel
+    other = db.query(User).filter(User.id == other_user_id).first()
+    if other and other.is_bot:
+        raise HTTPException(status_code=403, detail="You can't delete the bot chat")
+
     deleted = (db.query(Message)
                .filter(or_(
                    and_(Message.sender_id == user.id, Message.receiver_id == other_user_id),
@@ -549,6 +761,7 @@ def post_message(data: SendMessageIn,
                  db: Session = Depends(get_db)):
     if not data.content.strip():
         raise HTTPException(status_code=400, detail="Empty message")
+
     receiver = db.query(User).filter(User.id == data.to).first()
     if not receiver:
         raise HTTPException(status_code=404, detail="Recipient not found")
@@ -571,6 +784,28 @@ def post_message(data: SendMessageIn,
         asyncio.create_task(manager.send_to(data.to, payload_out))
     except Exception:
         pass
+
+    # If the recipient is the bot, generate a reply
+    if receiver.is_bot:
+        try:
+            reply_text = bot_reply(db, user, data.content.strip())
+            reply_msg = send_bot_message(db, user.id, reply_text)
+            if reply_msg:
+                reply_payload = {
+                    "id": reply_msg.id,
+                    "from": reply_msg.sender_id,
+                    "from_username": BOT_USERNAME,
+                    "to": user.id,
+                    "content": reply_msg.content,
+                    "created_at": reply_msg.created_at.isoformat(),
+                }
+                try:
+                    import asyncio
+                    asyncio.create_task(manager.send_to(user.id, reply_payload))
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     return MessageOut(
         id=msg.id,
@@ -601,7 +836,6 @@ def delete_message(message_id: int,
 
 @app.get("/app/version", response_model=Optional[ReleaseOut])
 def app_version(db: Session = Depends(get_db)):
-    """Public endpoint. Returns the newest release, or 404 if none published."""
     latest = (db.query(Release)
               .order_by(Release.version_code.desc())
               .first())
@@ -642,7 +876,6 @@ def admin_publish_release(data: ReleaseCreate,
 
     existing = db.query(Release).filter(Release.version_code == data.version_code).first()
     if existing:
-        # Update existing
         existing.version_name = data.version_name
         existing.download_url = data.download_url
         existing.notes = data.notes or ""
@@ -680,7 +913,51 @@ def admin_delete_release(version_code: int,
 
 
 # ---------------------------------------------------------------------
-# Admin panel (single HTML page served from FastAPI)
+# Broadcast (admin → bot → all users)
+# ---------------------------------------------------------------------
+
+@app.post("/admin/broadcast")
+def admin_broadcast(data: BroadcastIn,
+                    x_admin_key: Optional[str] = Header(None),
+                    db: Session = Depends(get_db)):
+    require_admin(x_admin_key)
+
+    text_content = data.content.strip()
+    if not text_content:
+        raise HTTPException(status_code=400, detail="Empty broadcast")
+
+    bot = get_bot(db)
+    if not bot:
+        raise HTTPException(status_code=500, detail="Bot account missing")
+
+    users = db.query(User).filter(User.is_bot == False).all()
+    sent = 0
+    for u in users:
+        try:
+            msg = send_bot_message(db, u.id, text_content)
+            if msg:
+                try:
+                    import asyncio
+                    payload = {
+                        "id": msg.id,
+                        "from": msg.sender_id,
+                        "from_username": BOT_USERNAME,
+                        "to": u.id,
+                        "content": msg.content,
+                        "created_at": msg.created_at.isoformat(),
+                    }
+                    asyncio.create_task(manager.send_to(u.id, payload))
+                except Exception:
+                    pass
+                sent += 1
+        except Exception:
+            continue
+
+    return {"sent_to": sent, "total_users": len(users)}
+
+
+# ---------------------------------------------------------------------
+# Admin panel
 # ---------------------------------------------------------------------
 
 ADMIN_HTML = """<!DOCTYPE html>
@@ -703,13 +980,22 @@ ADMIN_HTML = """<!DOCTYPE html>
     background: #1a1a2e; border-radius: 14px;
     padding: 18px; margin-bottom: 16px;
   }
+  .tabs { display: flex; gap: 8px; margin-bottom: 16px; }
+  .tab {
+    padding: 10px 16px; border-radius: 10px; background: #22223a;
+    color: #8e8ea8; font-size: 13px; cursor: pointer; border: 0;
+    font-family: inherit;
+  }
+  .tab.active { background: #ff5c39; color: white; }
+  .pane { display: none; }
+  .pane.active { display: block; }
   label { display: block; font-size: 12px; color: #8e8ea8; margin-bottom: 6px; }
   input, textarea {
     width: 100%; padding: 12px; border: 0; border-radius: 10px;
     background: #22223a; color: #f2f2f7; font-size: 14px;
     font-family: inherit; outline: none;
   }
-  textarea { min-height: 80px; resize: vertical; }
+  textarea { min-height: 100px; resize: vertical; }
   input:focus, textarea:focus { background: #2a2a44; }
   .row { display: flex; gap: 10px; }
   .row > div { flex: 1; }
@@ -756,7 +1042,7 @@ ADMIN_HTML = """<!DOCTYPE html>
 <body>
 <div class="wrap">
   <h1>Lantern — Admin</h1>
-  <div class="sub">Publish updates to all users</div>
+  <div class="sub">Publish updates and send broadcasts as the bot</div>
 
   <div class="card">
     <div class="field">
@@ -765,55 +1051,84 @@ ADMIN_HTML = """<!DOCTYPE html>
     </div>
   </div>
 
-  <div class="card">
-    <h3 style="margin-top:0;font-size:15px;font-weight:500">Publish a release</h3>
-    <div class="row">
-      <div class="field">
-        <label>Version code (integer)</label>
-        <input id="vcode" type="number" placeholder="5">
-      </div>
-      <div class="field">
-        <label>Version name</label>
-        <input id="vname" type="text" placeholder="1.4">
-      </div>
-    </div>
-    <div class="field">
-      <label>Download URL</label>
-      <input id="url" type="text" placeholder="https://github.com/.../lantern.apk">
-    </div>
-    <div class="field">
-      <label>Release notes</label>
-      <textarea id="notes" placeholder="What changed?"></textarea>
-    </div>
-    <div class="checkbox-row">
-      <input id="blocking" type="checkbox">
-      <label for="blocking">Block users below this version (use carefully)</label>
-    </div>
-    <button class="primary" id="publishBtn" onclick="publish()">Publish</button>
-    <div class="error" id="error"></div>
+  <div class="tabs">
+    <button class="tab active" onclick="switchTab('releases')">Releases</button>
+    <button class="tab" onclick="switchTab('broadcast')">Broadcast</button>
   </div>
 
-  <div class="card">
-    <h3 style="margin-top:0;font-size:15px;font-weight:500">Published releases</h3>
-    <div id="list" style="margin-top:12px"></div>
+  <div class="pane active" id="pane-releases">
+    <div class="card">
+      <h3 style="margin-top:0;font-size:15px;font-weight:500">Publish a release</h3>
+      <div class="row">
+        <div class="field">
+          <label>Version code (integer)</label>
+          <input id="vcode" type="number" placeholder="5">
+        </div>
+        <div class="field">
+          <label>Version name</label>
+          <input id="vname" type="text" placeholder="1.4">
+        </div>
+      </div>
+      <div class="field">
+        <label>Download URL</label>
+        <input id="url" type="text" placeholder="https://github.com/.../lantern.apk">
+      </div>
+      <div class="field">
+        <label>Release notes</label>
+        <textarea id="notes" placeholder="What changed?"></textarea>
+      </div>
+      <div class="checkbox-row">
+        <input id="blocking" type="checkbox">
+        <label for="blocking">Block users below this version (use carefully)</label>
+      </div>
+      <button class="primary" id="publishBtn" onclick="publish()">Publish</button>
+      <div class="error" id="error"></div>
+    </div>
+
+    <div class="card">
+      <h3 style="margin-top:0;font-size:15px;font-weight:500">Published releases</h3>
+      <div id="list" style="margin-top:12px"></div>
+    </div>
+  </div>
+
+  <div class="pane" id="pane-broadcast">
+    <div class="card">
+      <h3 style="margin-top:0;font-size:15px;font-weight:500">Send a broadcast</h3>
+      <div class="sub" style="margin-bottom:16px">
+        This sends a message from the Lantern Good Boy bot to every user.
+        It appears in their bot chat and triggers a notification.
+      </div>
+      <div class="field">
+        <label>Message</label>
+        <textarea id="bcontent" placeholder="What do you want to announce?"></textarea>
+      </div>
+      <button class="primary" id="broadcastBtn" onclick="sendBroadcast()">Send to all users</button>
+      <div class="error" id="berror"></div>
+      <div id="bresult" style="margin-top:12px;color:#8e8ea8;font-size:13px"></div>
+    </div>
   </div>
 </div>
 
 <div class="toast" id="toast"></div>
 
 <script>
-const API = "";
 let allReleases = [];
 
 function toast(msg) {
   const t = document.getElementById('toast');
   t.textContent = msg;
   t.classList.add('show');
-  setTimeout(() => t.classList.remove('show'), 2000);
+  setTimeout(() => t.classList.remove('show'), 2500);
+}
+
+function switchTab(name) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('.pane').forEach(p => p.classList.remove('active'));
+  document.getElementById('pane-' + name).classList.add('active');
+  event.target.classList.add('active');
 }
 
 function onKeyInput() {
-  // Auto-fill from URL hash if provided
   const key = document.getElementById('key').value;
   if (key.length > 0) loadReleases();
 }
@@ -932,6 +1247,45 @@ async function deleteRelease(vcode) {
   }
 }
 
+async function sendBroadcast() {
+  const key = document.getElementById('key').value;
+  if (!key) { document.getElementById('berror').textContent = 'Enter admin key'; return; }
+
+  const content = document.getElementById('bcontent').value.trim();
+  if (!content) { document.getElementById('berror').textContent = 'Write something first'; return; }
+
+  if (!confirm('Send this to every user?')) return;
+
+  document.getElementById('berror').textContent = '';
+  document.getElementById('bresult').textContent = '';
+  document.getElementById('broadcastBtn').disabled = true;
+
+  try {
+    const r = await fetch('/admin/broadcast', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Admin-Key': key
+      },
+      body: JSON.stringify({ content: content })
+    });
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({}));
+      document.getElementById('berror').textContent = err.detail || 'Broadcast failed';
+    } else {
+      const res = await r.json();
+      document.getElementById('bresult').textContent =
+        'Sent to ' + res.sent_to + ' of ' + res.total_users + ' users.';
+      document.getElementById('bcontent').value = '';
+      toast('Broadcast sent');
+    }
+  } catch (e) {
+    document.getElementById('berror').textContent = 'Network error';
+  } finally {
+    document.getElementById('broadcastBtn').disabled = false;
+  }
+}
+
 // Auto-fill key from ?key= in URL
 (function() {
   const params = new URLSearchParams(window.location.search);
@@ -994,7 +1348,7 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
     db = SessionLocal()
     try:
         u = db.query(User).filter(User.id == user_id).first()
-        if u:
+        if u and not u.is_bot:
             u.last_seen = datetime.utcnow()
             db.commit()
 
@@ -1006,13 +1360,17 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
             if not receiver_id or not content:
                 continue
 
+            receiver = db.query(User).filter(User.id == receiver_id).first()
+            if not receiver:
+                continue
+
             msg = Message(sender_id=user_id, receiver_id=receiver_id, content=content)
             db.add(msg)
             db.commit()
             db.refresh(msg)
 
             u = db.query(User).filter(User.id == user_id).first()
-            if u:
+            if u and not u.is_bot:
                 u.last_seen = datetime.utcnow()
                 db.commit()
 
@@ -1027,6 +1385,24 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
 
             await manager.send_to(user_id, payload_out)
             await manager.send_to(receiver_id, payload_out)
+
+            # If the message went to the bot, generate a reply
+            if receiver.is_bot:
+                try:
+                    reply_text = bot_reply(db, u, content)
+                    reply_msg = send_bot_message(db, user_id, reply_text)
+                    if reply_msg:
+                        reply_payload = {
+                            "id": reply_msg.id,
+                            "from": reply_msg.sender_id,
+                            "from_username": BOT_USERNAME,
+                            "to": user_id,
+                            "content": reply_msg.content,
+                            "created_at": reply_msg.created_at.isoformat(),
+                        }
+                        await manager.send_to(user_id, reply_payload)
+                except Exception:
+                    pass
 
     except WebSocketDisconnect:
         manager.disconnect(user_id)
