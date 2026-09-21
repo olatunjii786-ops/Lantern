@@ -1015,7 +1015,7 @@ def get_global_room_info(user: User = Depends(get_current_user),
 
 
 @app.get("/rooms/global/messages")
-def get_global_room_messages(limit: int = 100,
+def get_global_room_messages(limit: int = 40,
                              user: User = Depends(get_current_user),
                              db: Session = Depends(get_db)):
     room = get_global_room(db)
