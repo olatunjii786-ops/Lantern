@@ -1619,10 +1619,25 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
                 # Don't deliver to a deleted user
                 continue
 
-            msg = Message(sender_id=user_id, receiver_id=receiver_id, content=content)
-            db.add(msg)
-            db.commit()
-            db.refresh(msg)
+          stored_ts = None
+if data.created_at:
+    try:
+        parsed = datetime.fromisoformat(data.created_at.replace("Z", "+00:00"))
+        parsed_naive = parsed.replace(tzinfo=None)
+        delta = abs((datetime.utcnow() - parsed_naive).total_seconds())
+        if delta < 60:
+            stored_ts = parsed_naive
+    except Exception:
+        pass
+
+if stored_ts is not None:
+    msg = Message(sender_id=user.id, receiver_id=data.to,
+                  content=data.content.strip(), created_at=stored_ts)
+else:
+    msg = Message(sender_id=user.id, receiver_id=data.to, content=data.content.strip())
+db.add(msg)
+db.commit()
+db.refresh(msg)
 
             u = db.query(User).filter(User.id == user_id).first()
             if u and not u.is_bot:
