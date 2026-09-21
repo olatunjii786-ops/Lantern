@@ -1085,9 +1085,11 @@ def post_global_room_message(data: SendRoomMessageIn,
         "reply_to": reply_preview_of(db, msg),
     }
 
+    # Send to everyone EXCEPT the sender. The sender already drew their
+    # optimistic bubble client-side, so echoing back would duplicate.
     try:
         import asyncio
-        asyncio.create_task(manager.broadcast(payload_out))
+        asyncio.create_task(manager.broadcast_except(user.id, payload_out))
     except Exception:
         pass
 
@@ -1524,7 +1526,7 @@ def admin_broadcast(data: BroadcastIn,
 
 
 # ---------------------------------------------------------------------
-# Admin panel  (unchanged — kept as-is; see your original file)
+# Admin panel
 # ---------------------------------------------------------------------
 
 ADMIN_HTML = """<!DOCTYPE html>
@@ -1945,6 +1947,11 @@ def admin_panel():
 # ---------------------------------------------------------------------
 
 class ConnectionManager:
+    """
+    Holds WebSocket connections per user. Multiple sockets per user
+    are all delivered to. A disconnect removes only the specific
+    socket that dropped.
+    """
     def __init__(self):
         self.active: dict[int, set[WebSocket]] = {}
 
@@ -1974,7 +1981,15 @@ class ConnectionManager:
             self.disconnect(user_id, ws)
 
     async def broadcast(self, message: dict):
+        """Send to every connected socket, across all users."""
         for uid in list(self.active.keys()):
+            await self.send_to(uid, message)
+
+    async def broadcast_except(self, exclude_user_id: int, message: dict):
+        """Send to every connected socket except one user's sockets."""
+        for uid in list(self.active.keys()):
+            if uid == exclude_user_id:
+                continue
             await self.send_to(uid, message)
 
 
@@ -2078,7 +2093,8 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
                     "created_at": msg.created_at.isoformat(),
                     "reply_to": reply_preview_of(db, msg),
                 }
-                await manager.broadcast(payload_out)
+                # Don't echo back to the sender's own socket.
+                await manager.broadcast_except(user_id, payload_out)
                 continue
 
             # Regular DM
