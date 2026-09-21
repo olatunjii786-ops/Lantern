@@ -1,6 +1,13 @@
 """
 Lantern Backend — FastAPI + Neon Postgres + JWT + WebSockets
 Single-file backend for the Lantern chat app.
+
+Includes:
+- Auth, profile, discover, search, conversations, messages
+- Release / update system + admin panel + broadcast
+- Bot account ("thegoodboy"): welcome, help, broadcasts
+- Read tracking (read_at on messages), soft-delete for accounts
+- WebSocket typing events
 """
 
 import os
@@ -65,6 +72,8 @@ class User(Base):
     show_interests = Column(Boolean, default=True, nullable=False)
     show_online = Column(Boolean, default=True, nullable=False)
 
+    deleted_at = Column(DateTime(timezone=True), nullable=True)
+
     last_seen = Column(DateTime(timezone=True), server_default=func.now())
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
@@ -77,6 +86,7 @@ class Message(Base):
     receiver_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     content = Column(String, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+    read_at = Column(DateTime(timezone=True), nullable=True)
 
     sender = relationship("User", foreign_keys=[sender_id])
     receiver = relationship("User", foreign_keys=[receiver_id])
@@ -115,6 +125,8 @@ _ensure_column("users", "is_bot", "BOOLEAN", "FALSE")
 _ensure_column("users", "show_bio", "BOOLEAN", "TRUE")
 _ensure_column("users", "show_interests", "BOOLEAN", "TRUE")
 _ensure_column("users", "show_online", "BOOLEAN", "TRUE")
+_ensure_column("users", "deleted_at", "TIMESTAMP WITH TIME ZONE")
+_ensure_column("messages", "read_at", "TIMESTAMP WITH TIME ZONE")
 
 
 # ---------------------------------------------------------------------
@@ -273,6 +285,7 @@ class UserOut(BaseModel):
     interests: Optional[str]
     avatar: Optional[str]
     is_bot: bool
+    is_deleted: bool
     show_bio: bool
     show_interests: bool
     show_online: bool
@@ -285,8 +298,10 @@ class UserOut(BaseModel):
 class PublicUserOut(BaseModel):
     id: int
     username: str
+    display_name: str
     avatar: Optional[str]
     is_bot: bool
+    is_deleted: bool
     bio: Optional[str]
     interests: List[str]
     online: Optional[bool]
@@ -324,12 +339,15 @@ class DiscoverUser(BaseModel):
 class ConversationOut(BaseModel):
     user_id: int
     username: str
+    display_name: str
     avatar: Optional[str]
     is_bot: bool
+    is_deleted: bool
     last_message: str
     last_timestamp: str
     online: Optional[bool]
     last_seen_text: Optional[str]
+    unread_count: int
 
 
 class SendMessageIn(BaseModel):
@@ -343,6 +361,7 @@ class MessageOut(BaseModel):
     receiver_id: int
     content: str
     created_at: str
+    read_at: Optional[str]
 
 
 class ReleaseCreate(BaseModel):
@@ -364,6 +383,10 @@ class ReleaseOut(BaseModel):
 
 class BroadcastIn(BaseModel):
     content: str
+
+
+class DeleteAccountIn(BaseModel):
+    confirm_username: str
 
 
 # ---------------------------------------------------------------------
@@ -412,6 +435,8 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
     user = db.query(User).filter(User.id == int(payload["sub"])).first()
     if not user:
         raise HTTPException(status_code=401, detail="User not found")
+    if user.deleted_at is not None:
+        raise HTTPException(status_code=401, detail="Account deleted")
     user.last_seen = datetime.utcnow()
     db.commit()
     return user
@@ -439,6 +464,8 @@ def serialize_interests(tags: Optional[List[str]]) -> Optional[str]:
 def is_online(user: User) -> bool:
     if user.is_bot:
         return True
+    if user.deleted_at is not None:
+        return False
     if not user.last_seen:
         return False
     delta = datetime.utcnow() - user.last_seen.replace(tzinfo=None)
@@ -480,18 +507,34 @@ def validate_avatar(avatar: Optional[str]) -> Optional[str]:
     return "data:image/jpeg;base64," + avatar
 
 
+def display_name_of(user: User) -> str:
+    if user.deleted_at is not None:
+        return "Deleted User"
+    return user.username
+
+
 def public_view_of(user: User) -> PublicUserOut:
     if user.is_bot:
         return PublicUserOut(
-            id=user.id, username=user.username, avatar=user.avatar,
-            is_bot=True, bio=user.bio or "", interests=[],
+            id=user.id, username=user.username, display_name="Lantern Good Boy",
+            avatar=user.avatar, is_bot=True, is_deleted=False,
+            bio=user.bio or "", interests=[],
             online=True, last_seen_text="online",
+        )
+    if user.deleted_at is not None:
+        return PublicUserOut(
+            id=user.id, username=user.username, display_name="Deleted User",
+            avatar=None, is_bot=False, is_deleted=True,
+            bio=None, interests=[],
+            online=None, last_seen_text=None,
         )
     return PublicUserOut(
         id=user.id,
         username=user.username,
+        display_name=user.username,
         avatar=user.avatar,
         is_bot=False,
+        is_deleted=False,
         bio=(user.bio or "") if user.show_bio else None,
         interests=parse_interests(user.interests) if user.show_interests else [],
         online=is_online(user) if user.show_online else None,
@@ -569,6 +612,8 @@ def login(form: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get
         raise HTTPException(status_code=401, detail="Invalid credentials")
     if user.is_bot:
         raise HTTPException(status_code=403, detail="Not a user account")
+    if user.deleted_at is not None:
+        raise HTTPException(status_code=403, detail="This account has been deleted")
     user.last_seen = datetime.utcnow()
     db.commit()
     return Token(access_token=create_access_token(user.id, user.username))
@@ -579,10 +624,33 @@ def me(user: User = Depends(get_current_user)):
     return UserOut(
         id=user.id, username=user.username, email=user.email, phone=user.phone,
         bio=user.bio, interests=user.interests, avatar=user.avatar,
-        is_bot=user.is_bot,
+        is_bot=user.is_bot, is_deleted=False,
         show_bio=user.show_bio, show_interests=user.show_interests, show_online=user.show_online,
         online=True,
     )
+
+
+@app.delete("/users/me")
+def delete_account(data: DeleteAccountIn,
+                   user: User = Depends(get_current_user),
+                   db: Session = Depends(get_db)):
+    if user.is_bot:
+        raise HTTPException(status_code=403, detail="Cannot delete bot account")
+    if data.confirm_username != user.username:
+        raise HTTPException(status_code=400, detail="Confirmation username does not match")
+
+    # Free up username / email / phone for future registrations
+    old_username = user.username
+    user.username = f"deleted_{user.id}_{old_username}"
+    user.email = None
+    user.phone = None
+    user.bio = None
+    user.interests = None
+    user.avatar = None
+    user.hashed_password = ""  # can no longer log in
+    user.deleted_at = datetime.utcnow()
+    db.commit()
+    return {"deleted": True}
 
 
 @app.put("/users/me", response_model=UserOut)
@@ -633,7 +701,7 @@ def update_profile(data: ProfileUpdate,
     return UserOut(
         id=user.id, username=user.username, email=user.email, phone=user.phone,
         bio=user.bio, interests=user.interests, avatar=user.avatar,
-        is_bot=user.is_bot,
+        is_bot=user.is_bot, is_deleted=False,
         show_bio=user.show_bio, show_interests=user.show_interests, show_online=user.show_online,
         online=True,
     )
@@ -651,6 +719,7 @@ def discover(limit: int = 30,
     pool = (db.query(User)
             .filter(User.id != user.id)
             .filter(User.is_bot == False)
+            .filter(User.deleted_at == None)
             .order_by(User.last_seen.desc().nullslast())
             .limit(200)
             .all())
@@ -686,6 +755,7 @@ def random_user(user: User = Depends(get_current_user),
     u = (db.query(User)
          .filter(User.id != user.id)
          .filter(User.is_bot == False)
+         .filter(User.deleted_at == None)
          .order_by(func.random())
          .first())
     if not u:
@@ -712,6 +782,7 @@ def search_users(q: str,
                .filter(User.username.ilike(f"%{q}%"))
                .filter(User.id != user.id)
                .filter(User.is_bot == False)
+               .filter(User.deleted_at == None)
                .limit(20).all())
     out = []
     for u in results:
@@ -750,12 +821,11 @@ def get_public_user(user_id: int,
         raise HTTPException(status_code=404, detail="User not found")
     if target.id == user.id:
         return PublicUserOut(
-            id=target.id, username=target.username, avatar=target.avatar,
-            is_bot=target.is_bot,
+            id=target.id, username=target.username, display_name=target.username,
+            avatar=target.avatar, is_bot=target.is_bot, is_deleted=False,
             bio=target.bio or "",
             interests=parse_interests(target.interests),
-            online=True,
-            last_seen_text="just now",
+            online=True, last_seen_text="just now",
         )
     return public_view_of(target)
 
@@ -786,22 +856,61 @@ def conversations(user: User = Depends(get_current_user),
     """)
     rows = db.execute(sql, {"me": user.id}).fetchall()
 
+    # Unread counts per other user (messages from them to me, unread)
+    unread_sql = text("""
+        SELECT sender_id, COUNT(*) AS c
+        FROM messages
+        WHERE receiver_id = :me AND read_at IS NULL
+        GROUP BY sender_id
+    """)
+    unread_rows = db.execute(unread_sql, {"me": user.id}).fetchall()
+    unread_by_user = {row[0]: row[1] for row in unread_rows}
+
     out = []
     for other_id, content, created_at in rows:
         u = db.query(User).filter(User.id == other_id).first()
         if not u:
             continue
+        unread = unread_by_user.get(other_id, 0)
         out.append(ConversationOut(
             user_id=u.id,
             username=u.username,
-            avatar=u.avatar,
+            display_name=display_name_of(u),
+            avatar=(u.avatar if u.deleted_at is None else None),
             is_bot=u.is_bot,
+            is_deleted=(u.deleted_at is not None),
             last_message=content,
             last_timestamp=created_at.isoformat(),
             online=(is_online(u) if (u.is_bot or u.show_online) else None),
             last_seen_text=(humanize_last_seen(u) if (u.is_bot or u.show_online) else None),
+            unread_count=unread,
         ))
     return out
+
+
+@app.post("/conversations/{other_user_id}/read")
+def mark_conversation_read(other_user_id: int,
+                           user: User = Depends(get_current_user),
+                           db: Session = Depends(get_db)):
+    now = datetime.utcnow()
+    updated = (db.query(Message)
+               .filter(Message.sender_id == other_user_id)
+               .filter(Message.receiver_id == user.id)
+               .filter(Message.read_at == None)
+               .update({"read_at": now}, synchronize_session=False))
+    db.commit()
+
+    # Notify the sender their messages were read
+    try:
+        import asyncio
+        asyncio.create_task(manager.send_to(other_user_id, {
+            "type": "read",
+            "by": user.id,
+        }))
+    except Exception:
+        pass
+
+    return {"marked_read": updated}
 
 
 @app.delete("/conversations/{other_user_id}")
@@ -846,6 +955,7 @@ def get_messages(other_user_id: int,
             "receiver_id": m.receiver_id,
             "content": m.content,
             "created_at": m.created_at.isoformat(),
+            "read_at": m.read_at.isoformat() if m.read_at else None,
         }
         for m in msgs
     ]
@@ -861,6 +971,8 @@ def post_message(data: SendMessageIn,
     receiver = db.query(User).filter(User.id == data.to).first()
     if not receiver:
         raise HTTPException(status_code=404, detail="Recipient not found")
+    if receiver.deleted_at is not None:
+        raise HTTPException(status_code=403, detail="This user has deleted their account")
 
     msg = Message(sender_id=user.id, receiver_id=data.to, content=data.content.strip())
     db.add(msg)
@@ -874,6 +986,7 @@ def post_message(data: SendMessageIn,
         "to": data.to,
         "content": msg.content,
         "created_at": msg.created_at.isoformat(),
+        "read_at": None,
     }
     try:
         import asyncio
@@ -893,6 +1006,7 @@ def post_message(data: SendMessageIn,
                     "to": user.id,
                     "content": reply_msg.content,
                     "created_at": reply_msg.created_at.isoformat(),
+                    "read_at": None,
                 }
                 try:
                     import asyncio
@@ -908,6 +1022,7 @@ def post_message(data: SendMessageIn,
         receiver_id=msg.receiver_id,
         content=msg.content,
         created_at=msg.created_at.isoformat(),
+        read_at=None,
     )
 
 
@@ -1025,7 +1140,7 @@ def admin_broadcast(data: BroadcastIn,
     if not bot:
         raise HTTPException(status_code=500, detail="Bot account missing")
 
-    users = db.query(User).filter(User.is_bot == False).all()
+    users = db.query(User).filter(User.is_bot == False).filter(User.deleted_at == None).all()
     sent = 0
     for u in users:
         try:
@@ -1040,6 +1155,7 @@ def admin_broadcast(data: BroadcastIn,
                         "to": u.id,
                         "content": msg.content,
                         "created_at": msg.created_at.isoformat(),
+                        "read_at": None,
                     }
                     asyncio.create_task(manager.send_to(u.id, payload))
                 except Exception:
@@ -1054,62 +1170,6 @@ def admin_broadcast(data: BroadcastIn,
 # ---------------------------------------------------------------------
 # Admin panel
 # ---------------------------------------------------------------------
-
-@app.post("/admin/test-delivery")
-async def admin_test_delivery(x_admin_key: Optional[str] = Header(None),
-                              db: Session = Depends(get_db)):
-    """
-    Sends a *stored* diagnostic message from the bot to every user
-    with an active WebSocket. Behaves exactly like a real incoming
-    message — it's saved to the DB, delivered over WS, and will
-    appear in the chat when opened.
-    """
-    require_admin(x_admin_key)
-    bot = get_bot(db)
-    if not bot:
-        raise HTTPException(status_code=500, detail="Bot missing")
-
-    report = {}
-    for uid in list(manager.active.keys()):
-        try:
-            # Save the message exactly like a real one
-            msg = Message(
-                sender_id=bot.id,
-                receiver_id=uid,
-                content="Diagnostic ping — this is a real stored message."
-            )
-            db.add(msg)
-            db.commit()
-            db.refresh(msg)
-
-            payload = {
-                "id": msg.id,
-                "from": bot.id,
-                "from_username": BOT_USERNAME,
-                "to": uid,
-                "content": msg.content,
-                "created_at": msg.created_at.isoformat(),
-            }
-
-            # Deliver to every active socket for this user
-            sockets = manager.active.get(uid, set())
-            delivered = 0
-            for ws in list(sockets):
-                try:
-                    await ws.send_json(payload)
-                    delivered += 1
-                except Exception:
-                    manager.disconnect(uid, ws)
-
-            report[uid] = {"stored": msg.id, "delivered": delivered}
-        except Exception as e:
-            report[uid] = {"error": str(e)}
-
-    return {
-        "active_user_ids": list(manager.active.keys()),
-        "sockets_per_user": {uid: len(s) for uid, s in manager.active.items()},
-        "report": report,
-    }
 
 ADMIN_HTML = """<!DOCTYPE html>
 <html lang="en">
@@ -1461,9 +1521,9 @@ def admin_panel():
 
 class ConnectionManager:
     """
-    Holds WebSocket connections per user. A single user can have multiple
-    live connections (e.g., one from the foreground activity, one from
-    the background service). All of them get every message.
+    Holds WebSocket connections per user. Multiple sockets per user
+    are all delivered to. A disconnect removes only the specific
+    socket that dropped.
     """
     def __init__(self):
         self.active: dict[int, set[WebSocket]] = {}
@@ -1507,6 +1567,16 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
     user_id = int(payload["sub"])
     username = payload["username"]
 
+    # Reject if account deleted
+    db0 = SessionLocal()
+    try:
+        u0 = db0.query(User).filter(User.id == user_id).first()
+        if not u0 or u0.deleted_at is not None:
+            await websocket.close(code=1008)
+            return
+    finally:
+        db0.close()
+
     await manager.connect(user_id, websocket)
 
     db = SessionLocal()
@@ -1518,6 +1588,24 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
 
         while True:
             data = await websocket.receive_json()
+            msg_type = (data.get("type") or "message").strip()
+
+            # Typing events — forward without storing
+            if msg_type in ("typing", "stop_typing"):
+                target = data.get("to")
+                if not target:
+                    continue
+                try:
+                    await manager.send_to(int(target), {
+                        "type": msg_type,
+                        "from": user_id,
+                        "from_username": username,
+                    })
+                except Exception:
+                    pass
+                continue
+
+            # Regular message
             receiver_id = data.get("to")
             content = (data.get("content") or "").strip()
 
@@ -1526,6 +1614,9 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
 
             receiver = db.query(User).filter(User.id == receiver_id).first()
             if not receiver:
+                continue
+            if receiver.deleted_at is not None:
+                # Don't deliver to a deleted user
                 continue
 
             msg = Message(sender_id=user_id, receiver_id=receiver_id, content=content)
@@ -1545,6 +1636,7 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
                 "to": receiver_id,
                 "content": content,
                 "created_at": msg.created_at.isoformat(),
+                "read_at": None,
             }
 
             await manager.send_to(user_id, payload_out)
@@ -1562,6 +1654,7 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
                             "to": user_id,
                             "content": reply_msg.content,
                             "created_at": reply_msg.created_at.isoformat(),
+                            "read_at": None,
                         }
                         await manager.send_to(user_id, reply_payload)
                 except Exception:
