@@ -972,29 +972,23 @@ def get_global_room_info(user: User = Depends(get_current_user),
     )
 
 
-@app.get("/rooms/global/messages")
-def get_global_room_messages(limit: int = 100,
-                             user: User = Depends(get_current_user),
-                             db: Session = Depends(get_db)):
-    room = get_global_room(db)
-    msgs = (db.query(Message)
-            .filter(Message.room_id == room.id)
-            .order_by(Message.created_at.desc())
-            .limit(limit).all())
-    msgs.reverse()
-
+@app.get("/rooms/global/members", response_model=List[RoomMemberOut])
+def get_room_members(user: User = Depends(get_current_user),
+                     db: Session = Depends(get_db)):
+    users = (db.query(User)
+             .filter(User.is_bot == False)
+             .filter(User.deleted_at == None)
+             .order_by(User.username.asc())
+             .limit(500)
+             .all())
     out = []
-    for m in msgs:
-        sender = db.query(User).filter(User.id == m.sender_id).first()
-        out.append({
-            "id": m.id,
-            "sender_id": m.sender_id,
-            "sender_username": sender.username if sender else "unknown",
-            "sender_display_name": display_name_of(sender) if sender else "Unknown",
-            "sender_avatar": (sender.avatar if sender and sender.deleted_at is None else None),
-            "content": m.content,
-            "created_at": m.created_at.isoformat(),
-        })
+    for u in users:
+        out.append(RoomMemberOut(
+            id=u.id,
+            username=u.username,
+            avatar=None,     # <-- don't ship the full image; fetch on tap
+            online=(is_online(u) if u.show_online else None),
+        ))
     return out
 
 
