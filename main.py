@@ -1653,7 +1653,6 @@ else:
 db.add(msg)
 db.commit()
 db.refresh(msg)
-# ... rest stays as-is
 
             u = db.query(User).filter(User.id == user_id).first()
             if u and not u.is_bot:
