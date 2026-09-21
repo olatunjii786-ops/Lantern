@@ -353,7 +353,7 @@ class ConversationOut(BaseModel):
 class SendMessageIn(BaseModel):
     to: int
     content: str
-
+    created_at: Optional[str] = None
 
 class MessageOut(BaseModel):
     id: int
@@ -974,11 +974,26 @@ def post_message(data: SendMessageIn,
     if receiver.deleted_at is not None:
         raise HTTPException(status_code=403, detail="This user has deleted their account")
 
-    msg = Message(sender_id=user.id, receiver_id=data.to, content=data.content.strip())
+    stored_ts = None
+    if data.created_at:
+        try:
+            parsed = datetime.fromisoformat(data.created_at.replace("Z", "+00:00"))
+            parsed_naive = parsed.replace(tzinfo=None)
+            delta = abs((datetime.utcnow() - parsed_naive).total_seconds())
+            if delta < 60:
+                stored_ts = parsed_naive
+        except Exception:
+            pass
+
+    if stored_ts is not None:
+        msg = Message(sender_id=user.id, receiver_id=data.to,
+                      content=data.content.strip(), created_at=stored_ts)
+    else:
+        msg = Message(sender_id=user.id, receiver_id=data.to, content=data.content.strip())
     db.add(msg)
     db.commit()
     db.refresh(msg)
-
+    # ... rest of the function stays the same
     payload_out = {
         "id": msg.id,
         "from": user.id,
@@ -1613,16 +1628,16 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
                 continue
 
             receiver = db.query(User).filter(User.id == receiver_id).first()
-            if not receiver:
-                continue
-            if receiver.deleted_at is not None:
-                # Don't deliver to a deleted user
-                continue
+if not receiver:
+    continue
+if receiver.deleted_at is not None:
+    continue
 
-          stored_ts = None
-if data.created_at:
+client_ts = data.get("created_at")
+stored_ts = None
+if client_ts:
     try:
-        parsed = datetime.fromisoformat(data.created_at.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(client_ts.replace("Z", "+00:00"))
         parsed_naive = parsed.replace(tzinfo=None)
         delta = abs((datetime.utcnow() - parsed_naive).total_seconds())
         if delta < 60:
@@ -1631,13 +1646,14 @@ if data.created_at:
         pass
 
 if stored_ts is not None:
-    msg = Message(sender_id=user.id, receiver_id=data.to,
-                  content=data.content.strip(), created_at=stored_ts)
+    msg = Message(sender_id=user_id, receiver_id=receiver_id,
+                  content=content, created_at=stored_ts)
 else:
-    msg = Message(sender_id=user.id, receiver_id=data.to, content=data.content.strip())
+    msg = Message(sender_id=user_id, receiver_id=receiver_id, content=content)
 db.add(msg)
 db.commit()
 db.refresh(msg)
+# ... rest stays as-is
 
             u = db.query(User).filter(User.id == user_id).first()
             if u and not u.is_bot:
