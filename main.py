@@ -1025,9 +1025,47 @@ def get_global_room_messages(limit: int = 100,
             .limit(limit).all())
     msgs.reverse()
 
+    # --- Batch lookups (avoid N+1 queries) ---
+
+    # 1. All unique sender ids in this page of messages
+    sender_ids = {m.sender_id for m in msgs if m.sender_id is not None}
+    senders_by_id = {}
+    if sender_ids:
+        senders = db.query(User).filter(User.id.in_(sender_ids)).all()
+        senders_by_id = {u.id: u for u in senders}
+
+    # 2. All unique parent message ids referenced by replies
+    parent_ids = {m.reply_to_id for m in msgs if m.reply_to_id is not None}
+    parents_by_id = {}
+    parent_senders_by_id = {}
+    if parent_ids:
+        parents = db.query(Message).filter(Message.id.in_(parent_ids)).all()
+        parents_by_id = {p.id: p for p in parents}
+        parent_sender_ids = {p.sender_id for p in parents if p.sender_id is not None}
+        if parent_sender_ids:
+            psenders = db.query(User).filter(User.id.in_(parent_sender_ids)).all()
+            parent_senders_by_id = {u.id: u for u in psenders}
+
+    def build_reply_preview(m: Message):
+        if not m.reply_to_id:
+            return None
+        parent = parents_by_id.get(m.reply_to_id)
+        if not parent:
+            return None
+        psender = parent_senders_by_id.get(parent.sender_id)
+        text = parent.content or ""
+        if len(text) > 100:
+            text = text[:97] + "..."
+        return {
+            "id": parent.id,
+            "sender_id": parent.sender_id,
+            "sender_username": psender.username if psender else "unknown",
+            "content": text,
+        }
+
     out = []
     for m in msgs:
-        sender = db.query(User).filter(User.id == m.sender_id).first()
+        sender = senders_by_id.get(m.sender_id)
         out.append({
             "id": m.id,
             "sender_id": m.sender_id,
@@ -1036,7 +1074,7 @@ def get_global_room_messages(limit: int = 100,
             "sender_avatar": (sender.avatar if sender and sender.deleted_at is None else None),
             "content": m.content,
             "created_at": m.created_at.isoformat(),
-            "reply_to": reply_preview_of(db, m),
+            "reply_to": build_reply_preview(m),
         })
     return out
 
