@@ -1,13 +1,6 @@
 """
 Lantern Backend — FastAPI + Neon Postgres + JWT + WebSockets
 Single-file backend for the Lantern chat app.
-
-Includes:
-- Auth, profile, discover, search, conversations, messages
-- Release / update system + admin panel + broadcast
-- Bot account ("thegoodboy"): welcome, help, broadcasts
-- Read tracking (read_at on messages), soft-delete for accounts
-- WebSocket typing events
 """
 
 import os
@@ -39,7 +32,6 @@ ONLINE_WINDOW_SECONDS = 300
 MAX_AVATAR_BYTES = 200_000
 
 BOT_USERNAME = "thegoodboy"
-BOT_DISPLAY = "Lantern Good Boy"
 BOT_BIO = "Your guide to Lantern. I welcome new users, post announcements, and answer app questions. I'm a bot — not a person. Type 'help' any time."
 BOT_PASSWORD = secrets.token_hex(32)
 
@@ -355,6 +347,7 @@ class SendMessageIn(BaseModel):
     content: str
     created_at: Optional[str] = None
 
+
 class MessageOut(BaseModel):
     id: int
     sender_id: int
@@ -513,6 +506,21 @@ def display_name_of(user: User) -> str:
     return user.username
 
 
+def resolve_client_timestamp(raw: Optional[str]) -> Optional[datetime]:
+    """Accept a client ISO timestamp if it's within 60s of server time."""
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        parsed_naive = parsed.replace(tzinfo=None)
+        delta = abs((datetime.utcnow() - parsed_naive).total_seconds())
+        if delta < 60:
+            return parsed_naive
+    except Exception:
+        pass
+    return None
+
+
 def public_view_of(user: User) -> PublicUserOut:
     if user.is_bot:
         return PublicUserOut(
@@ -639,7 +647,6 @@ def delete_account(data: DeleteAccountIn,
     if data.confirm_username != user.username:
         raise HTTPException(status_code=400, detail="Confirmation username does not match")
 
-    # Free up username / email / phone for future registrations
     old_username = user.username
     user.username = f"deleted_{user.id}_{old_username}"
     user.email = None
@@ -647,7 +654,7 @@ def delete_account(data: DeleteAccountIn,
     user.bio = None
     user.interests = None
     user.avatar = None
-    user.hashed_password = ""  # can no longer log in
+    user.hashed_password = ""
     user.deleted_at = datetime.utcnow()
     db.commit()
     return {"deleted": True}
@@ -856,7 +863,6 @@ def conversations(user: User = Depends(get_current_user),
     """)
     rows = db.execute(sql, {"me": user.id}).fetchall()
 
-    # Unread counts per other user (messages from them to me, unread)
     unread_sql = text("""
         SELECT sender_id, COUNT(*) AS c
         FROM messages
@@ -900,7 +906,6 @@ def mark_conversation_read(other_user_id: int,
                .update({"read_at": now}, synchronize_session=False))
     db.commit()
 
-    # Notify the sender their messages were read
     try:
         import asyncio
         asyncio.create_task(manager.send_to(other_user_id, {
@@ -974,16 +979,7 @@ def post_message(data: SendMessageIn,
     if receiver.deleted_at is not None:
         raise HTTPException(status_code=403, detail="This user has deleted their account")
 
-    stored_ts = None
-    if data.created_at:
-        try:
-            parsed = datetime.fromisoformat(data.created_at.replace("Z", "+00:00"))
-            parsed_naive = parsed.replace(tzinfo=None)
-            delta = abs((datetime.utcnow() - parsed_naive).total_seconds())
-            if delta < 60:
-                stored_ts = parsed_naive
-        except Exception:
-            pass
+    stored_ts = resolve_client_timestamp(data.created_at)
 
     if stored_ts is not None:
         msg = Message(sender_id=user.id, receiver_id=data.to,
@@ -993,7 +989,7 @@ def post_message(data: SendMessageIn,
     db.add(msg)
     db.commit()
     db.refresh(msg)
-    # ... rest of the function stays the same
+
     payload_out = {
         "id": msg.id,
         "from": user.id,
@@ -1582,7 +1578,6 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
     user_id = int(payload["sub"])
     username = payload["username"]
 
-    # Reject if account deleted
     db0 = SessionLocal()
     try:
         u0 = db0.query(User).filter(User.id == user_id).first()
@@ -1605,7 +1600,6 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
             data = await websocket.receive_json()
             msg_type = (data.get("type") or "message").strip()
 
-            # Typing events — forward without storing
             if msg_type in ("typing", "stop_typing"):
                 target = data.get("to")
                 if not target:
@@ -1620,7 +1614,6 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
                     pass
                 continue
 
-            # Regular message
             receiver_id = data.get("to")
             content = (data.get("content") or "").strip()
 
@@ -1628,31 +1621,21 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
                 continue
 
             receiver = db.query(User).filter(User.id == receiver_id).first()
-if not receiver:
-    continue
-if receiver.deleted_at is not None:
-    continue
+            if not receiver:
+                continue
+            if receiver.deleted_at is not None:
+                continue
 
-client_ts = data.get("created_at")
-stored_ts = None
-if client_ts:
-    try:
-        parsed = datetime.fromisoformat(client_ts.replace("Z", "+00:00"))
-        parsed_naive = parsed.replace(tzinfo=None)
-        delta = abs((datetime.utcnow() - parsed_naive).total_seconds())
-        if delta < 60:
-            stored_ts = parsed_naive
-    except Exception:
-        pass
+            stored_ts = resolve_client_timestamp(data.get("created_at"))
 
-if stored_ts is not None:
-    msg = Message(sender_id=user_id, receiver_id=receiver_id,
-                  content=content, created_at=stored_ts)
-else:
-    msg = Message(sender_id=user_id, receiver_id=receiver_id, content=content)
-db.add(msg)
-db.commit()
-db.refresh(msg)
+            if stored_ts is not None:
+                msg = Message(sender_id=user_id, receiver_id=receiver_id,
+                              content=content, created_at=stored_ts)
+            else:
+                msg = Message(sender_id=user_id, receiver_id=receiver_id, content=content)
+            db.add(msg)
+            db.commit()
+            db.refresh(msg)
 
             u = db.query(User).filter(User.id == user_id).first()
             if u and not u.is_bot:
