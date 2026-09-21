@@ -1,6 +1,13 @@
 """
 Lantern Backend — FastAPI + Neon Postgres + JWT + WebSockets
 Single-file backend for the Lantern chat app.
+
+Includes:
+- Auth, profile, discover, search, conversations, messages
+- Read tracking, soft-delete, typing events
+- Global Room — one room everyone is in
+- Release / update system + admin panel + broadcast
+- Bot account ("thegoodboy")
 """
 
 import os
@@ -30,10 +37,13 @@ ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7
 ONLINE_WINDOW_SECONDS = 300
 MAX_AVATAR_BYTES = 200_000
+ROOM_RATE_LIMIT_SECONDS = 2
 
 BOT_USERNAME = "thegoodboy"
 BOT_BIO = "Your guide to Lantern. I welcome new users, post announcements, and answer app questions. I'm a bot — not a person. Type 'help' any time."
 BOT_PASSWORD = secrets.token_hex(32)
+
+DEFAULT_ROOM_NAME = "Global Room"
 
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL environment variable is required")
@@ -70,12 +80,21 @@ class User(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
+class Room(Base):
+    __tablename__ = "rooms"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
 class Message(Base):
     __tablename__ = "messages"
 
     id = Column(Integer, primary_key=True, index=True)
     sender_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    receiver_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    receiver_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    room_id = Column(Integer, ForeignKey("rooms.id"), nullable=True)
     content = Column(String, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     read_at = Column(DateTime(timezone=True), nullable=True)
@@ -119,6 +138,23 @@ _ensure_column("users", "show_interests", "BOOLEAN", "TRUE")
 _ensure_column("users", "show_online", "BOOLEAN", "TRUE")
 _ensure_column("users", "deleted_at", "TIMESTAMP WITH TIME ZONE")
 _ensure_column("messages", "read_at", "TIMESTAMP WITH TIME ZONE")
+_ensure_column("messages", "room_id", "INTEGER")
+
+
+# ---------------------------------------------------------------------
+# Global Room helpers
+# ---------------------------------------------------------------------
+
+def get_global_room(db: Session) -> Room:
+    """Return the one global room, creating it if missing."""
+    room = db.query(Room).order_by(Room.id.asc()).first()
+    if room:
+        return room
+    room = Room(name=DEFAULT_ROOM_NAME)
+    db.add(room)
+    db.commit()
+    db.refresh(room)
+    return room
 
 
 # ---------------------------------------------------------------------
@@ -171,6 +207,7 @@ def bot_welcome_text(username: str) -> str:
         f"Hey {username} 👋 I'm Lantern Good Boy — the app's bot.\n\n"
         "I'm not a person, but I'm here to help.\n\n"
         "• Tap Discover to find real people to chat with.\n"
+        "• Tap 'Global Room' at the top to talk with everyone.\n"
         "• Type 'help' any time to see what I can do.\n\n"
         "Good luck out there."
     )
@@ -184,7 +221,8 @@ def bot_help_text() -> str:
         "• notifications — how to control alerts\n"
         "• update — how to get the latest version\n"
         "• privacy — what this app stores about you\n"
-        "• discover — how to find people to talk to\n\n"
+        "• discover — how to find people to talk to\n"
+        "• room — about the Global Room\n\n"
         "I can't chat freely — I'm just here to help and share announcements."
     )
 
@@ -194,6 +232,14 @@ def bot_reply(db: Session, user: User, text: str) -> str:
 
     if t in ("help", "hi", "hello", "hey", "start"):
         return bot_help_text()
+
+    if "room" in t or "global" in t:
+        return (
+            "The Global Room is one big chat where everyone on Lantern can talk.\n\n"
+            "• It's at the top of your Chats tab\n"
+            "• Everyone who joins Lantern is automatically in it\n"
+            "• Be kind — everyone can see your messages"
+        )
 
     if "profile" in t or "photo" in t or "avatar" in t or "bio" in t:
         return (
@@ -342,8 +388,29 @@ class ConversationOut(BaseModel):
     unread_count: int
 
 
+class RoomOut(BaseModel):
+    id: int
+    name: str
+    member_count: int
+
+
+class RoomMessageOut(BaseModel):
+    id: int
+    sender_id: int
+    sender_username: str
+    sender_display_name: str
+    sender_avatar: Optional[str]
+    content: str
+    created_at: str
+
+
 class SendMessageIn(BaseModel):
     to: int
+    content: str
+    created_at: Optional[str] = None
+
+
+class SendRoomMessageIn(BaseModel):
     content: str
     created_at: Optional[str] = None
 
@@ -380,6 +447,10 @@ class BroadcastIn(BaseModel):
 
 class DeleteAccountIn(BaseModel):
     confirm_username: str
+
+
+class RenameRoomIn(BaseModel):
+    name: str
 
 
 # ---------------------------------------------------------------------
@@ -507,7 +578,6 @@ def display_name_of(user: User) -> str:
 
 
 def resolve_client_timestamp(raw: Optional[str]) -> Optional[datetime]:
-    """Accept a client ISO timestamp if it's within 60s of server time."""
     if not raw:
         return None
     try:
@@ -560,6 +630,11 @@ app = FastAPI(title="Lantern Backend")
 @app.on_event("startup")
 def on_startup():
     ensure_bot_exists()
+    db = SessionLocal()
+    try:
+        get_global_room(db)
+    finally:
+        db.close()
 
 
 @app.get("/")
@@ -838,6 +913,106 @@ def get_public_user(user_id: int,
 
 
 # ---------------------------------------------------------------------
+# Global Room
+# ---------------------------------------------------------------------
+
+@app.get("/rooms/global", response_model=RoomOut)
+def get_global_room_info(user: User = Depends(get_current_user),
+                         db: Session = Depends(get_db)):
+    room = get_global_room(db)
+    member_count = (db.query(User)
+                    .filter(User.is_bot == False)
+                    .filter(User.deleted_at == None)
+                    .count())
+    return RoomOut(id=room.id, name=room.name, member_count=member_count)
+
+
+@app.get("/rooms/global/messages")
+def get_global_room_messages(limit: int = 100,
+                             user: User = Depends(get_current_user),
+                             db: Session = Depends(get_db)):
+    room = get_global_room(db)
+    msgs = (db.query(Message)
+            .filter(Message.room_id == room.id)
+            .order_by(Message.created_at.desc())
+            .limit(limit).all())
+    msgs.reverse()
+
+    out = []
+    for m in msgs:
+        sender = db.query(User).filter(User.id == m.sender_id).first()
+        out.append({
+            "id": m.id,
+            "sender_id": m.sender_id,
+            "sender_username": sender.username if sender else "unknown",
+            "sender_display_name": display_name_of(sender) if sender else "Unknown",
+            "sender_avatar": (sender.avatar if sender and sender.deleted_at is None else None),
+            "content": m.content,
+            "created_at": m.created_at.isoformat(),
+        })
+    return out
+
+
+@app.post("/rooms/global/messages", response_model=RoomMessageOut)
+def post_global_room_message(data: SendRoomMessageIn,
+                             user: User = Depends(get_current_user),
+                             db: Session = Depends(get_db)):
+    content = data.content.strip()
+    if not content:
+        raise HTTPException(status_code=400, detail="Empty message")
+
+    # Rate limit: one message every ROOM_RATE_LIMIT_SECONDS
+    recent_cutoff = datetime.utcnow() - timedelta(seconds=ROOM_RATE_LIMIT_SECONDS)
+    recent = (db.query(Message)
+              .filter(Message.sender_id == user.id)
+              .filter(Message.room_id != None)
+              .filter(Message.created_at >= recent_cutoff)
+              .first())
+    if recent is not None:
+        raise HTTPException(status_code=429, detail="Slow down — one message every few seconds")
+
+    room = get_global_room(db)
+    stored_ts = resolve_client_timestamp(data.created_at)
+
+    if stored_ts is not None:
+        msg = Message(sender_id=user.id, room_id=room.id,
+                      content=content, created_at=stored_ts)
+    else:
+        msg = Message(sender_id=user.id, room_id=room.id, content=content)
+    db.add(msg)
+    db.commit()
+    db.refresh(msg)
+
+    payload_out = {
+        "type": "room_message",
+        "room_id": room.id,
+        "id": msg.id,
+        "sender_id": user.id,
+        "sender_username": user.username,
+        "sender_display_name": display_name_of(user),
+        "sender_avatar": user.avatar,
+        "content": msg.content,
+        "created_at": msg.created_at.isoformat(),
+    }
+
+    try:
+        import asyncio
+        asyncio.create_task(manager.broadcast(payload_out))
+    except Exception:
+        pass
+
+    return RoomMessageOut(
+        id=msg.id,
+        sender_id=msg.sender_id,
+        sender_username=user.username,
+        sender_display_name=display_name_of(user),
+        sender_avatar=user.avatar,
+        content=msg.content,
+        created_at=msg.created_at.isoformat(),
+    )
+
+
+# ---------------------------------------------------------------------
 # Conversations
 # ---------------------------------------------------------------------
 
@@ -856,7 +1031,8 @@ def conversations(user: User = Depends(get_current_user),
                        ORDER BY created_at DESC
                    ) AS rn
             FROM messages
-            WHERE sender_id = :me OR receiver_id = :me
+            WHERE (sender_id = :me OR receiver_id = :me)
+              AND room_id IS NULL
         ) t
         WHERE rn = 1
         ORDER BY created_at DESC
@@ -866,7 +1042,7 @@ def conversations(user: User = Depends(get_current_user),
     unread_sql = text("""
         SELECT sender_id, COUNT(*) AS c
         FROM messages
-        WHERE receiver_id = :me AND read_at IS NULL
+        WHERE receiver_id = :me AND read_at IS NULL AND room_id IS NULL
         GROUP BY sender_id
     """)
     unread_rows = db.execute(unread_sql, {"me": user.id}).fetchall()
@@ -902,6 +1078,7 @@ def mark_conversation_read(other_user_id: int,
     updated = (db.query(Message)
                .filter(Message.sender_id == other_user_id)
                .filter(Message.receiver_id == user.id)
+               .filter(Message.room_id == None)
                .filter(Message.read_at == None)
                .update({"read_at": now}, synchronize_session=False))
     db.commit()
@@ -927,6 +1104,7 @@ def delete_conversation(other_user_id: int,
         raise HTTPException(status_code=403, detail="You can't delete the bot chat")
 
     deleted = (db.query(Message)
+               .filter(Message.room_id == None)
                .filter(or_(
                    and_(Message.sender_id == user.id, Message.receiver_id == other_user_id),
                    and_(Message.sender_id == other_user_id, Message.receiver_id == user.id),
@@ -937,7 +1115,7 @@ def delete_conversation(other_user_id: int,
 
 
 # ---------------------------------------------------------------------
-# Messages
+# Messages (DMs)
 # ---------------------------------------------------------------------
 
 @app.get("/messages/{other_user_id}")
@@ -946,6 +1124,7 @@ def get_messages(other_user_id: int,
                  user: User = Depends(get_current_user),
                  db: Session = Depends(get_db)):
     msgs = (db.query(Message)
+            .filter(Message.room_id == None)
             .filter(or_(
                 and_(Message.sender_id == user.id, Message.receiver_id == other_user_id),
                 and_(Message.sender_id == other_user_id, Message.receiver_id == user.id),
@@ -1134,6 +1313,46 @@ def admin_delete_release(version_code: int,
 
 
 # ---------------------------------------------------------------------
+# Admin — Room
+# ---------------------------------------------------------------------
+
+@app.get("/admin/room")
+def admin_get_room(x_admin_key: Optional[str] = Header(None),
+                   db: Session = Depends(get_db)):
+    require_admin(x_admin_key)
+    room = get_global_room(db)
+    return {"id": room.id, "name": room.name}
+
+
+@app.put("/admin/room")
+def admin_rename_room(data: RenameRoomIn,
+                      x_admin_key: Optional[str] = Header(None),
+                      db: Session = Depends(get_db)):
+    require_admin(x_admin_key)
+    new_name = (data.name or "").strip()
+    if not new_name:
+        raise HTTPException(status_code=400, detail="Name can't be empty")
+    if len(new_name) > 60:
+        raise HTTPException(status_code=400, detail="Name too long (max 60)")
+
+    room = get_global_room(db)
+    room.name = new_name
+    db.commit()
+
+    try:
+        import asyncio
+        asyncio.create_task(manager.broadcast({
+            "type": "room_renamed",
+            "room_id": room.id,
+            "name": room.name,
+        }))
+    except Exception:
+        pass
+
+    return {"id": room.id, "name": room.name}
+
+
+# ---------------------------------------------------------------------
 # Broadcast
 # ---------------------------------------------------------------------
 
@@ -1259,12 +1478,13 @@ ADMIN_HTML = """<!DOCTYPE html>
   }
   .toast.show { opacity: 1; }
   .error { color: #ff5c39; font-size: 13px; margin-top: 8px; }
+  .success { color: #3FD86A; font-size: 13px; margin-top: 8px; }
 </style>
 </head>
 <body>
 <div class="wrap">
   <h1>Lantern — Admin</h1>
-  <div class="sub">Publish updates and send broadcasts as the bot</div>
+  <div class="sub">Publish updates, send broadcasts, and manage the Global Room</div>
 
   <div class="card">
     <div class="field">
@@ -1276,6 +1496,7 @@ ADMIN_HTML = """<!DOCTYPE html>
   <div class="tabs">
     <button class="tab active" onclick="switchTab('releases', event)">Releases</button>
     <button class="tab" onclick="switchTab('broadcast', event)">Broadcast</button>
+    <button class="tab" onclick="switchTab('room', event)">Global Room</button>
   </div>
 
   <div class="pane active" id="pane-releases">
@@ -1328,6 +1549,22 @@ ADMIN_HTML = """<!DOCTYPE html>
       <div id="bresult" style="margin-top:12px;color:#8e8ea8;font-size:13px"></div>
     </div>
   </div>
+
+  <div class="pane" id="pane-room">
+    <div class="card">
+      <h3 style="margin-top:0;font-size:15px;font-weight:500">Global Room</h3>
+      <div class="sub" style="margin-bottom:16px">
+        Rename the room everyone is in. Changes take effect immediately for all users.
+      </div>
+      <div class="field">
+        <label>Room name</label>
+        <input id="roomName" type="text" placeholder="Global Room">
+      </div>
+      <button class="primary" id="roomBtn" onclick="renameRoom()">Save room name</button>
+      <div class="error" id="rerror"></div>
+      <div class="success" id="rresult"></div>
+    </div>
+  </div>
 </div>
 
 <div class="toast" id="toast"></div>
@@ -1347,11 +1584,61 @@ function switchTab(name, ev) {
   document.querySelectorAll('.pane').forEach(p => p.classList.remove('active'));
   document.getElementById('pane-' + name).classList.add('active');
   if (ev && ev.target) ev.target.classList.add('active');
+  if (name === 'room') loadRoom();
 }
 
 function onKeyInput() {
   const key = document.getElementById('key').value;
-  if (key.length > 0) loadReleases();
+  if (key.length > 0) {
+    loadReleases();
+    loadRoom();
+  }
+}
+
+async function loadRoom() {
+  const key = document.getElementById('key').value;
+  if (!key) return;
+  try {
+    const r = await fetch('/admin/room', { headers: { 'X-Admin-Key': key } });
+    if (r.ok) {
+      const data = await r.json();
+      document.getElementById('roomName').value = data.name;
+    }
+  } catch (e) {}
+}
+
+async function renameRoom() {
+  const key = document.getElementById('key').value;
+  if (!key) { document.getElementById('rerror').textContent = 'Enter admin key'; return; }
+
+  const name = document.getElementById('roomName').value.trim();
+  if (!name) { document.getElementById('rerror').textContent = 'Name is required'; return; }
+
+  document.getElementById('rerror').textContent = '';
+  document.getElementById('rresult').textContent = '';
+  document.getElementById('roomBtn').disabled = true;
+
+  try {
+    const r = await fetch('/admin/room', {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Admin-Key': key
+      },
+      body: JSON.stringify({ name: name })
+    });
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({}));
+      document.getElementById('rerror').textContent = err.detail || 'Rename failed';
+    } else {
+      document.getElementById('rresult').textContent = 'Room renamed to "' + name + '"';
+      toast('Room renamed');
+    }
+  } catch (e) {
+    document.getElementById('rerror').textContent = 'Network error';
+  } finally {
+    document.getElementById('roomBtn').disabled = false;
+  }
 }
 
 async function loadReleases() {
@@ -1513,6 +1800,7 @@ async function sendBroadcast() {
   if (k) {
     document.getElementById('key').value = k;
     loadReleases();
+    loadRoom();
   }
 })();
 </script>
@@ -1564,6 +1852,11 @@ class ConnectionManager:
         for ws in dead:
             self.disconnect(user_id, ws)
 
+    async def broadcast(self, message: dict):
+        """Send to every connected socket, across all users."""
+        for uid in list(self.active.keys()):
+            await self.send_to(uid, message)
+
 
 manager = ConnectionManager()
 
@@ -1614,6 +1907,58 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
                     pass
                 continue
 
+            # Room message via WebSocket
+            if msg_type == "room_message":
+                content = (data.get("content") or "").strip()
+                if not content:
+                    continue
+
+                # Rate limit
+                recent_cutoff = datetime.utcnow() - timedelta(seconds=ROOM_RATE_LIMIT_SECONDS)
+                recent = (db.query(Message)
+                          .filter(Message.sender_id == user_id)
+                          .filter(Message.room_id != None)
+                          .filter(Message.created_at >= recent_cutoff)
+                          .first())
+                if recent is not None:
+                    await manager.send_to(user_id, {
+                        "type": "error",
+                        "message": "Slow down — one message every few seconds",
+                    })
+                    continue
+
+                room = get_global_room(db)
+                stored_ts = resolve_client_timestamp(data.get("created_at"))
+
+                if stored_ts is not None:
+                    msg = Message(sender_id=user_id, room_id=room.id,
+                                  content=content, created_at=stored_ts)
+                else:
+                    msg = Message(sender_id=user_id, room_id=room.id, content=content)
+                db.add(msg)
+                db.commit()
+                db.refresh(msg)
+
+                u = db.query(User).filter(User.id == user_id).first()
+                if u and not u.is_bot:
+                    u.last_seen = datetime.utcnow()
+                    db.commit()
+
+                payload_out = {
+                    "type": "room_message",
+                    "room_id": room.id,
+                    "id": msg.id,
+                    "sender_id": user_id,
+                    "sender_username": username,
+                    "sender_display_name": display_name_of(u) if u else username,
+                    "sender_avatar": u.avatar if u else None,
+                    "content": content,
+                    "created_at": msg.created_at.isoformat(),
+                }
+                await manager.broadcast(payload_out)
+                continue
+
+            # Regular DM
             receiver_id = data.get("to")
             content = (data.get("content") or "").strip()
 
