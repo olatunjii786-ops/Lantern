@@ -5,7 +5,7 @@ Single-file backend for the Lantern chat app.
 Includes:
 - Auth, profile, discover, search, conversations, messages
 - Read tracking, soft-delete, typing events
-- Global Room — one room everyone is in
+- Global Room — one room everyone is in, with unread counts and members list
 - Release / update system + admin panel + broadcast
 - Bot account ("thegoodboy")
 """
@@ -75,6 +75,7 @@ class User(Base):
     show_online = Column(Boolean, default=True, nullable=False)
 
     deleted_at = Column(DateTime(timezone=True), nullable=True)
+    room_last_read_at = Column(DateTime(timezone=True), nullable=True)
 
     last_seen = Column(DateTime(timezone=True), server_default=func.now())
     created_at = Column(DateTime(timezone=True), server_default=func.now())
@@ -137,8 +138,16 @@ _ensure_column("users", "show_bio", "BOOLEAN", "TRUE")
 _ensure_column("users", "show_interests", "BOOLEAN", "TRUE")
 _ensure_column("users", "show_online", "BOOLEAN", "TRUE")
 _ensure_column("users", "deleted_at", "TIMESTAMP WITH TIME ZONE")
+_ensure_column("users", "room_last_read_at", "TIMESTAMP WITH TIME ZONE")
 _ensure_column("messages", "read_at", "TIMESTAMP WITH TIME ZONE")
 _ensure_column("messages", "room_id", "INTEGER")
+
+# Ensure receiver_id can be null (room messages use room_id instead)
+with engine.begin() as conn:
+    try:
+        conn.execute(text("ALTER TABLE messages ALTER COLUMN receiver_id DROP NOT NULL"))
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------
@@ -146,7 +155,6 @@ _ensure_column("messages", "room_id", "INTEGER")
 # ---------------------------------------------------------------------
 
 def get_global_room(db: Session) -> Room:
-    """Return the one global room, creating it if missing."""
     room = db.query(Room).order_by(Room.id.asc()).first()
     if room:
         return room
@@ -392,6 +400,8 @@ class RoomOut(BaseModel):
     id: int
     name: str
     member_count: int
+    unread_count: int
+    last_message_preview: Optional[str]
 
 
 class RoomMessageOut(BaseModel):
@@ -402,6 +412,13 @@ class RoomMessageOut(BaseModel):
     sender_avatar: Optional[str]
     content: str
     created_at: str
+
+
+class RoomMemberOut(BaseModel):
+    id: int
+    username: str
+    avatar: Optional[str]
+    online: Optional[bool]
 
 
 class SendMessageIn(BaseModel):
@@ -924,7 +941,35 @@ def get_global_room_info(user: User = Depends(get_current_user),
                     .filter(User.is_bot == False)
                     .filter(User.deleted_at == None)
                     .count())
-    return RoomOut(id=room.id, name=room.name, member_count=member_count)
+
+    cutoff = user.room_last_read_at
+    unread_q = db.query(Message).filter(Message.room_id == room.id)
+    if cutoff is not None:
+        unread_q = unread_q.filter(Message.created_at > cutoff)
+    unread_q = unread_q.filter(Message.sender_id != user.id)
+    unread_count = unread_q.count()
+
+    last = (db.query(Message)
+            .filter(Message.room_id == room.id)
+            .order_by(Message.created_at.desc())
+            .first())
+    preview = None
+    if last is not None:
+        sender = db.query(User).filter(User.id == last.sender_id).first()
+        if sender is not None:
+            sender_label = "You" if sender.id == user.id else display_name_of(sender)
+            text = last.content
+            if len(text) > 80:
+                text = text[:77] + "..."
+            preview = f"{sender_label}: {text}"
+
+    return RoomOut(
+        id=room.id,
+        name=room.name,
+        member_count=member_count,
+        unread_count=unread_count,
+        last_message_preview=preview,
+    )
 
 
 @app.get("/rooms/global/messages")
@@ -961,7 +1006,6 @@ def post_global_room_message(data: SendRoomMessageIn,
     if not content:
         raise HTTPException(status_code=400, detail="Empty message")
 
-    # Rate limit: one message every ROOM_RATE_LIMIT_SECONDS
     recent_cutoff = datetime.utcnow() - timedelta(seconds=ROOM_RATE_LIMIT_SECONDS)
     recent = (db.query(Message)
               .filter(Message.sender_id == user.id)
@@ -1010,6 +1054,34 @@ def post_global_room_message(data: SendRoomMessageIn,
         content=msg.content,
         created_at=msg.created_at.isoformat(),
     )
+
+
+@app.post("/rooms/global/read")
+def mark_room_read(user: User = Depends(get_current_user),
+                   db: Session = Depends(get_db)):
+    user.room_last_read_at = datetime.utcnow()
+    db.commit()
+    return {"ok": True}
+
+
+@app.get("/rooms/global/members", response_model=List[RoomMemberOut])
+def get_room_members(user: User = Depends(get_current_user),
+                     db: Session = Depends(get_db)):
+    users = (db.query(User)
+             .filter(User.is_bot == False)
+             .filter(User.deleted_at == None)
+             .order_by(User.username.asc())
+             .limit(500)
+             .all())
+    out = []
+    for u in users:
+        out.append(RoomMemberOut(
+            id=u.id,
+            username=u.username,
+            avatar=u.avatar,
+            online=(is_online(u) if u.show_online else None),
+        ))
+    return out
 
 
 # ---------------------------------------------------------------------
@@ -1913,7 +1985,6 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
                 if not content:
                     continue
 
-                # Rate limit
                 recent_cutoff = datetime.utcnow() - timedelta(seconds=ROOM_RATE_LIMIT_SECONDS)
                 recent = (db.query(Message)
                           .filter(Message.sender_id == user_id)
