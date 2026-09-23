@@ -46,7 +46,6 @@ from main import (
     get_global_room,
     get_bot,
     display_name_of,
-    signed_url_for_key as _unused,  # not used; keep import shape stable
 )
 
 # ---------------------------------------------------------------------
