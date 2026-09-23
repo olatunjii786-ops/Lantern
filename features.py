@@ -20,7 +20,6 @@ import io
 import os
 import uuid
 import asyncio
-import random
 import urllib.request
 import urllib.error
 from datetime import datetime, timedelta, timezone
@@ -462,10 +461,6 @@ def get_reactions(message_id: int,
 # ---------------------------------------------------------------------
 
 def online_user_ids() -> list:
-    """
-    Return the list of user ids that currently have at least one live WS
-    socket. This is the true "online right now" set.
-    """
     try:
         return [uid for uid, socks in manager.active.items() if socks]
     except Exception:
@@ -478,10 +473,6 @@ presence_router = APIRouter(tags=["presence"])
 @presence_router.get("/rooms/global/presence")
 def room_presence(user: User = Depends(get_current_user),
                   db: Session = Depends(get_db)):
-    """
-    Return the currently-online users in the room, with avatars.
-    The client renders these as a small horizontal row of bubbles.
-    """
     ids = online_user_ids()
     if not ids:
         return {"online": [], "count": 0}
@@ -492,7 +483,6 @@ def room_presence(user: User = Depends(get_current_user),
              .filter(User.deleted_at == None)
              .all())
 
-    # Exclude the caller from the roster — they know they're online.
     out = []
     for u in users:
         out.append({
@@ -505,7 +495,6 @@ def room_presence(user: User = Depends(get_current_user),
 
 
 async def _broadcast_presence(db: Session):
-    """Push the current online roster to every connected socket."""
     ids = online_user_ids()
     users = []
     if ids:
@@ -532,7 +521,6 @@ async def _broadcast_presence(db: Session):
 
 
 def presence_on_connect(user_id: int):
-    """Called from main.py after a WS connects. Fire-and-forget broadcast."""
     db = SessionLocal()
     try:
         asyncio.create_task(_broadcast_presence(db))
@@ -546,7 +534,6 @@ def presence_on_connect(user_id: int):
 
 
 def presence_on_disconnect(user_id: int):
-    """Called from main.py after a WS disconnects."""
     db = SessionLocal()
     try:
         asyncio.create_task(_broadcast_presence(db))
@@ -568,10 +555,6 @@ QUOTE_USER_AGENT = "Lantern/1.0 (+https://lantern-dhhb.onrender.com)"
 
 
 def _fetch_today_quote() -> Optional[dict]:
-    """
-    Fetch today's quote from ZenQuotes. Returns {"q": "...", "a": "..."}
-    or None on failure.
-    """
     try:
         req = urllib.request.Request(ZENQUOTES_URL)
         req.add_header("User-Agent", QUOTE_USER_AGENT)
@@ -596,34 +579,173 @@ def _fetch_today_quote() -> Optional[dict]:
 def _palette_for_weekday(weekday: int):
     """
     weekday: 0 = Monday, 6 = Sunday.
-    Returns (top_rgb, bottom_rgb, glow_rgb).
+    Returns (top_rgb, bottom_rgb, glow_rgb, lantern_rgb).
     """
     palettes = {
-        0: ((20, 30, 70), (10, 15, 40), (90, 130, 220)),   # Mon - cool blue
-        1: ((20, 60, 50), (10, 35, 30), (90, 200, 160)),   # Tue - soft green
-        2: ((45, 35, 75), (25, 20, 45), (160, 130, 220)),  # Wed - lavender
-        3: ((80, 55, 25), (45, 30, 15), (220, 160, 80)),   # Thu - ochre
-        4: ((110, 45, 25), (60, 25, 15), (255, 120, 70)),  # Fri - orange
-        5: ((95, 60, 80), (55, 35, 50), (240, 160, 200)),  # Sat - pastel pink
-        6: ((90, 40, 60), (50, 25, 35), (230, 130, 160)),  # Sun - rose
+        0: ((20, 30, 70), (10, 15, 40), (90, 130, 220), (200, 220, 255)),
+        1: ((20, 60, 50), (10, 35, 30), (90, 200, 160), (200, 255, 230)),
+        2: ((45, 35, 75), (25, 20, 45), (160, 130, 220), (230, 215, 255)),
+        3: ((80, 55, 25), (45, 30, 15), (220, 160, 80), (255, 230, 190)),
+        4: ((110, 45, 25), (60, 25, 15), (255, 120, 70), (255, 220, 180)),
+        5: ((95, 60, 80), (55, 35, 50), (240, 160, 200), (255, 220, 240)),
+        6: ((90, 40, 60), (50, 25, 35), (230, 130, 160), (255, 215, 225)),
     }
     return palettes.get(weekday, palettes[4])
+
+
+def _load_font(size: int, bold: bool = False):
+    from PIL import ImageFont
+    candidates = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSerif-Bold.ttf" if bold else "/usr/share/fonts/truetype/liberation/LiberationSerif-Regular.ttf",
+    ]
+    for path in candidates:
+        try:
+            return ImageFont.truetype(path, size)
+        except Exception:
+            continue
+    return ImageFont.load_default()
+
+
+def _wrap_text(text: str, font, max_width: int, draw):
+    words = text.split()
+    lines = []
+    current = ""
+    for word in words:
+        test = (current + " " + word).strip()
+        try:
+            w = draw.textlength(test, font=font)
+        except Exception:
+            w = len(test) * (font.size if hasattr(font, "size") else 20)
+        if w <= max_width:
+            current = test
+        else:
+            if current:
+                lines.append(current)
+            current = word
+    if current:
+        lines.append(current)
+    return lines
+
+
+def _draw_lantern(size: int, body_rgb, glow_rgb) -> "object":
+    """
+    Draw a lantern as a transparent PIL Image of the given square size.
+    Returns an RGBA Image.
+    """
+    from PIL import Image, ImageDraw
+
+    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+
+    cx = size / 2.0
+    cy = size * 0.56
+    r = size * 0.30
+
+    # Halo
+    for i in range(50, 0, -1):
+        rr = r * (2.2 * i / 50)
+        alpha = int(50 * (1 - i / 50))
+        d.ellipse([cx - rr, cy - rr, cx + rr, cy + rr],
+                  fill=(glow_rgb[0], glow_rgb[1], glow_rgb[2], alpha))
+
+    # Handle arc
+    handle_w = max(3, int(size * 0.020))
+    d.arc(
+        [cx - r * 0.55, cy - r * 1.45, cx + r * 0.55, cy - r * 0.20],
+        start=180, end=360,
+        fill=(body_rgb[0], body_rgb[1], body_rgb[2], 255),
+        width=handle_w,
+    )
+
+    # Body — a soft glowing circle
+    for i in range(40, 0, -1):
+        rr = r * i / 40
+        t = i / 40.0
+        alpha = int(255 * (1 - t * 0.15))
+        br = int(body_rgb[0] * (0.6 + 0.4 * t))
+        bg = int(body_rgb[1] * (0.6 + 0.4 * t))
+        bb = int(body_rgb[2] * (0.6 + 0.4 * t))
+        d.ellipse([cx - rr, cy - rr, cx + rr, cy + rr],
+                  fill=(br, bg, bb, alpha))
+
+    # Highlight
+    d.ellipse(
+        [cx - r * 0.42, cy - r * 0.42, cx - r * 0.10, cy - r * 0.10],
+        fill=(255, 255, 255, 140),
+    )
+
+    # Base bar
+    bar_w = r * 1.7
+    bar_h = max(4, int(size * 0.018))
+    d.rounded_rectangle(
+        [cx - bar_w / 2, cy + r * 0.85, cx + bar_w / 2, cy + r * 0.85 + bar_h],
+        radius=bar_h // 2,
+        fill=(body_rgb[0], body_rgb[1], body_rgb[2], 255),
+    )
+
+    return img
+
+
+def _draw_rising_sun(size: int, sun_rgb) -> "object":
+    """Draw a simple rising sun with rays as an RGBA image."""
+    from PIL import Image, ImageDraw
+    import math
+
+    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+
+    cx = size / 2.0
+    cy = size * 0.62
+    r = size * 0.24
+
+    # Disc
+    d.ellipse([cx - r, cy - r, cx + r, cy + r],
+              fill=(sun_rgb[0], sun_rgb[1], sun_rgb[2], 255))
+
+    # Rays
+    ray_len = size * 0.12
+    ray_w = max(2, int(size * 0.035))
+    for k in range(8):
+        angle = math.radians(-180 + 22.5 * k)
+        x1 = cx + (r + size * 0.05) * math.cos(angle)
+        y1 = cy + (r + size * 0.05) * math.sin(angle)
+        x2 = x1 + ray_len * math.cos(angle)
+        y2 = y1 + ray_len * math.sin(angle)
+        d.line([x1, y1, x2, y2],
+               fill=(sun_rgb[0], sun_rgb[1], sun_rgb[2], 255),
+               width=ray_w)
+
+    # Horizon bar (ground line)
+    ground_y = cy + r + size * 0.06
+    d.rounded_rectangle(
+        [cx - size * 0.32, ground_y, cx + size * 0.32, ground_y + max(3, size * 0.03)],
+        radius=max(2, size * 0.015),
+        fill=(sun_rgb[0], sun_rgb[1], sun_rgb[2], 255),
+    )
+
+    return img
 
 
 def _draw_quote_card(quote_text: str, author: str, weekday: int) -> bytes:
     """
     Render a Lantern-themed quote card and return JPEG bytes.
-    Falls back to None on error (caller should handle).
+    Layout:
+      - gradient background with a soft radial glow
+      - large faint lantern watermark behind the quote
+      - small drawn sun + "Good morning, Lantern" header
+      - quote centered, author below
+      - ZenQuotes attribution at the bottom
     """
-    from PIL import Image, ImageDraw, ImageFont
+    from PIL import Image, ImageDraw
 
     W, H = 1080, 1350
-    top_rgb, bot_rgb, glow_rgb = _palette_for_weekday(weekday)
+    top_rgb, bot_rgb, glow_rgb, lantern_rgb = _palette_for_weekday(weekday)
 
+    # Base gradient
     img = Image.new("RGB", (W, H), top_rgb)
     draw = ImageDraw.Draw(img)
-
-    # Vertical gradient
     for y in range(H):
         t = y / float(H - 1)
         r = int(top_rgb[0] * (1 - t) + bot_rgb[0] * t)
@@ -631,119 +753,101 @@ def _draw_quote_card(quote_text: str, author: str, weekday: int) -> bytes:
         b = int(top_rgb[2] * (1 - t) + bot_rgb[2] * t)
         draw.line([(0, y), (W, y)], fill=(r, g, b))
 
-    # Soft radial glow near top
+    # Soft radial glow near the top
     glow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    gdraw = ImageDraw.Draw(glow)
-    cx, cy, radius = int(W * 0.5), int(H * 0.22), int(W * 0.55)
-    steps = 60
+    gd = ImageDraw.Draw(glow)
+    cx, cy, radius = int(W * 0.5), int(H * 0.28), int(W * 0.60)
+    steps = 70
     for i in range(steps, 0, -1):
-        r = int(radius * i / steps)
-        alpha = int(70 * (1 - i / steps))
-        gdraw.ellipse(
-            [cx - r, cy - r, cx + r, cy + r],
-            fill=(glow_rgb[0], glow_rgb[1], glow_rgb[2], alpha),
-        )
+        rr = int(radius * i / steps)
+        alpha = int(65 * (1 - i / steps))
+        gd.ellipse([cx - rr, cy - rr, cx + rr, cy + rr],
+                   fill=(glow_rgb[0], glow_rgb[1], glow_rgb[2], alpha))
     img = Image.alpha_composite(img.convert("RGBA"), glow).convert("RGB")
+
+    # ---------- Big faint lantern watermark behind the quote ----------
+    wm_size = int(W * 0.85)
+    wm = _draw_lantern(wm_size, lantern_rgb, glow_rgb)
+    # Drop the alpha to make it a subtle background mark
+    alpha = wm.split()[3]
+    alpha = alpha.point(lambda a: int(a * 0.16))
+    wm.putalpha(alpha)
+    wm_x = (W - wm_size) // 2
+    wm_y = (H - wm_size) // 2 + int(H * 0.02)
+    base = img.convert("RGBA")
+    base.alpha_composite(wm, (wm_x, wm_y))
+    img = base.convert("RGB")
     draw = ImageDraw.Draw(img)
 
-    # Fonts — try a few common ones, fall back to default.
-    def load_font(size: int, bold: bool = False):
-        candidates = [
-            "/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-            "/usr/share/fonts/truetype/liberation/LiberationSerif-Bold.ttf" if bold else "/usr/share/fonts/truetype/liberation/LiberationSerif-Regular.ttf",
-        ]
-        for path in candidates:
-            try:
-                return ImageFont.truetype(path, size)
-            except Exception:
-                continue
-        return ImageFont.load_default()
+    # ---------- Header: small sun + "Good morning, Lantern" ----------
+    header_font = _load_font(36, bold=True)
+    sun_size = 60
+    sun_img = _draw_rising_sun(sun_size, (255, 235, 190))
 
-    def wrap_text(text: str, font, max_width: int):
-        words = text.split()
-        lines = []
-        current = ""
-        tmp_draw = ImageDraw.Draw(Image.new("RGB", (1, 1)))
-        for word in words:
-            test = (current + " " + word).strip()
-            try:
-                w = tmp_draw.textlength(test, font=font)
-            except Exception:
-                w = len(test) * (font.size if hasattr(font, "size") else 20)
-            if w <= max_width:
-                current = test
-            else:
-                if current:
-                    lines.append(current)
-                current = word
-        if current:
-            lines.append(current)
-        return lines
-
-    # Quote body
-    quote_font = load_font(72, bold=False)
-    author_font = load_font(40, bold=False)
-    header_font = load_font(34, bold=True)
-
-    header_text = "🌅  Good morning, Lantern"
+    header_text = "Good morning, Lantern"
     try:
-        hw = draw.textlength(header_text, font=header_font)
+        text_w = draw.textlength(header_text, font=header_font)
     except Exception:
-        hw = len(header_text) * 20
-    draw.text(((W - hw) / 2, int(H * 0.08)), header_text,
-              font=header_font, fill=(255, 255, 255))
+        text_w = len(header_text) * 20
 
-    max_text_w = int(W * 0.78)
-    lines = wrap_text(quote_text, quote_font, max_text_w)
+    gap = 18
+    total_w = sun_size + gap + text_w
+    start_x = (W - total_w) // 2
+    header_y = int(H * 0.075)
+    sun_y = header_y + (36 - sun_size) // 2 + 4
 
-    line_h = 96
+    base = img.convert("RGBA")
+    base.alpha_composite(sun_img, (int(start_x), int(sun_y)))
+    img = base.convert("RGB")
+    draw = ImageDraw.Draw(img)
+
+    draw.text(
+        (start_x + sun_size + gap, header_y),
+        header_text,
+        font=header_font,
+        fill=(255, 255, 255),
+    )
+
+    # ---------- Quote text ----------
+    quote_font = _load_font(72, bold=False)
+    author_font = _load_font(42, bold=False)
+
+    max_text_w = int(W * 0.76)
+    lines = _wrap_text(quote_text, quote_font, max_text_w, draw)
+
+    line_h = 100
     total_h = len(lines) * line_h
-    y = (H - total_h) // 2
+    y = (H - total_h) // 2 - 40
     for line in lines:
         try:
             lw = draw.textlength(line, font=quote_font)
         except Exception:
             lw = len(line) * 36
-        # subtle drop shadow
+        # soft shadow for readability over the watermark
         draw.text(((W - lw) / 2 + 2, y + 2), line,
-                  font=quote_font, fill=(0, 0, 0))
+                  font=quote_font, fill=(0, 0, 0, 120))
         draw.text(((W - lw) / 2, y), line,
                   font=quote_font, fill=(255, 255, 255))
         y += line_h
 
-    # Author
+    # ---------- Author ----------
     author_line = f"— {author}"
     try:
         aw = draw.textlength(author_line, font=author_font)
     except Exception:
         aw = len(author_line) * 20
-    draw.text(((W - aw) / 2, y + 40), author_line,
-              font=author_font, fill=(230, 230, 240))
+    draw.text(((W - aw) / 2, y + 50), author_line,
+              font=author_font, fill=(235, 235, 245))
 
-    # Lantern watermark, bottom right — a small glowing circle
-    wx, wy, wr = int(W * 0.88), int(H * 0.92), 42
-    wm = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    wmd = ImageDraw.Draw(wm)
-    for i in range(20, 0, -1):
-        rr = int(wr * i / 20)
-        alpha = int(120 * (1 - i / 20))
-        wmd.ellipse([wx - rr, wy - rr, wx + rr, wy + rr],
-                    fill=(255, 210, 150, alpha))
-    wmd.ellipse([wx - wr // 2, wy - wr // 2, wx + wr // 2, wy + wr // 2],
-                fill=(255, 160, 90, 220))
-    img = Image.alpha_composite(img.convert("RGBA"), wm).convert("RGB")
-    draw = ImageDraw.Draw(img)
-
-    # Attribution
+    # ---------- Attribution ----------
     attr = "Powered by ZenQuotes"
-    attr_font = load_font(22, bold=False)
+    attr_font = _load_font(22, bold=False)
     try:
         atw = draw.textlength(attr, font=attr_font)
     except Exception:
         atw = len(attr) * 12
     draw.text(((W - atw) / 2, H - 60), attr,
-              font=attr_font, fill=(200, 200, 215))
+              font=attr_font, fill=(210, 210, 225))
 
     out = io.BytesIO()
     img.save(out, format="JPEG", quality=88, optimize=True)
@@ -751,10 +855,6 @@ def _draw_quote_card(quote_text: str, author: str, weekday: int) -> bytes:
 
 
 def post_daily_quote_once() -> bool:
-    """
-    Fetch today's quote, draw the card, upload to B2, post as a media
-    message in the Global Room from the bot. Returns True on success.
-    """
     db = SessionLocal()
     try:
         bot = get_bot(db)
@@ -851,7 +951,6 @@ def post_daily_quote_once() -> bool:
 
 
 async def _daily_quote_loop():
-    """Wait until the next scheduled time, post the quote, repeat."""
     while True:
         now = datetime.now(timezone.utc)
         target = now.replace(
@@ -873,15 +972,10 @@ async def _daily_quote_loop():
             post_daily_quote_once()
         except Exception as e:
             print(f"[features] daily quote loop error: {e!r}")
-        # brief cooldown so we don't double-post if the clock jumps
         await asyncio.sleep(60)
 
 
 def post_welcome_in_room(new_user_id: int, new_username: str):
-    """
-    Called from main.py after a successful register, so the bot posts
-    a welcome message in the Global Room.
-    """
     db = SessionLocal()
     try:
         bot = get_bot(db)
@@ -936,11 +1030,6 @@ def post_welcome_in_room(new_user_id: int, new_username: str):
 
 
 # ---------------------------------------------------------------------
-# Debug/admin: manual trigger of the daily quote
-# ---------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------
 # Message serialization helpers (called from main.py)
 # ---------------------------------------------------------------------
 
@@ -974,10 +1063,6 @@ def decorate_message_dict(msg: Message, d: dict) -> dict:
 
 def handle_feature_ws(user_id: int, username: str, db: Session,
                       msg_type: str, data: dict) -> bool:
-    """
-    Called from the WS loop in main.py for every incoming WS message.
-    Return True if we handled it. Currently no new WS inbound events.
-    """
     return False
 
 
@@ -990,6 +1075,10 @@ def register_features(app):
     app.include_router(media_router)
     app.include_router(reactions_router)
     app.include_router(presence_router)
+    
+    @app.post("/debug/run-daily-quote")
+def _debug_run_daily_quote():
+    return {"ok": post_daily_quote_once()}
 
     @app.on_event("startup")
     def _features_startup():
@@ -1004,8 +1093,6 @@ def register_features(app):
         except Exception as e:
             print(f"[features] message_reactions table create failed: {e!r}")
 
-        # Start the daily-quote scheduler. We capture the running loop here
-        # because main.py runs inside uvicorn's event loop.
         try:
             loop = asyncio.get_event_loop()
             if loop.is_running():
