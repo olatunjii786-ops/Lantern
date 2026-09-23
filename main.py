@@ -10,6 +10,7 @@ Includes:
 - Media messages (image / file / voice) — endpoints + WS transport
 - Message reactions (add / remove / list)
 - Global Room — one room everyone is in, with unread counts and members list
+- Presence (in-memory + WS broadcast)
 - Release / update system + admin panel + broadcast
 - Bot account ("thegoodboy")
 
@@ -55,7 +56,18 @@ DEFAULT_ROOM_NAME = "Global Room"
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL environment variable is required")
 
-engine = create_engine(DATABASE_URL, pool_pre_ping=True, connect_args={"sslmode": "require"})
+# Pool sizing: Neon free tier allows ~100 connections total across a project.
+# 10 + 20 overflow = 30 concurrent from this instance, which is comfortable
+# and prevents the QueuePool exhaustion that killed WS under load.
+engine = create_engine(
+    DATABASE_URL,
+    pool_pre_ping=True,
+    pool_size=10,
+    max_overflow=20,
+    pool_recycle=300,
+    pool_timeout=30,
+    connect_args={"sslmode": "require"},
+)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
@@ -2357,6 +2369,223 @@ class ConnectionManager:
 manager = ConnectionManager()
 
 
+def _ws_handle_message(db: Session, user_id: int, username: str, data: dict) -> None:
+    """
+    Handle a single inbound WS message. Opens and closes its own DB
+    operations but reuses the session passed in (which lives for one
+    message, not for the whole socket lifetime).
+    """
+    msg_type = (data.get("type") or "message").strip()
+
+    # Feature hook (reactions, presence events, future groups, etc.)
+    try:
+        from features import handle_feature_ws
+        if handle_feature_ws(user_id, username, db, msg_type, data):
+            return
+    except Exception as e:
+        print(f"[ws] feature handler error: {e!r}")
+
+    if msg_type in ("typing", "stop_typing"):
+        target = data.get("to")
+        if not target:
+            return
+        try:
+            import asyncio
+            asyncio.create_task(manager.send_to(int(target), {
+                "type": msg_type,
+                "event": msg_type,
+                "from": user_id,
+                "from_username": username,
+            }))
+        except Exception:
+            pass
+        return
+
+    if msg_type == "room_message":
+        content = (data.get("content") or "").strip()
+        media_kind = (data.get("media_kind") or "text").strip().lower()
+        media_key = data.get("media_key")
+        media_thumb_key = data.get("media_thumb_key")
+        media_name = data.get("media_name")
+        media_size = data.get("media_size")
+        media_width = data.get("media_width")
+        media_height = data.get("media_height")
+        media_duration = data.get("media_duration")
+
+        if media_kind == "text":
+            if not content:
+                return
+        else:
+            if not media_key:
+                return
+            if not content:
+                content = ""
+
+        recent_cutoff = datetime.utcnow() - timedelta(seconds=ROOM_RATE_LIMIT_SECONDS)
+        recent = (db.query(Message)
+                  .filter(Message.sender_id == user_id)
+                  .filter(Message.room_id != None)
+                  .filter(Message.created_at >= recent_cutoff)
+                  .first())
+        if recent is not None:
+            try:
+                import asyncio
+                asyncio.create_task(manager.send_to(user_id, {
+                    "type": "error",
+                    "event": "error",
+                    "message": "Slow down — one message every few seconds",
+                }))
+            except Exception:
+                pass
+            return
+
+        room = get_global_room(db)
+        stored_ts = resolve_client_timestamp(data.get("created_at"))
+        reply_to = data.get("reply_to_id")
+
+        msg = Message(
+            sender_id=user_id,
+            room_id=room.id,
+            content=content,
+            reply_to_id=reply_to,
+            type=media_kind,
+            media_key=media_key,
+            media_thumb_key=media_thumb_key,
+            media_name=media_name,
+            media_size=media_size,
+            media_width=media_width,
+            media_height=media_height,
+            media_duration=media_duration,
+        )
+        if stored_ts is not None:
+            msg.created_at = stored_ts
+
+        db.add(msg)
+        db.commit()
+        db.refresh(msg)
+
+        u = db.query(User).filter(User.id == user_id).first()
+        if u and not u.is_bot:
+            u.last_seen = datetime.utcnow()
+            db.commit()
+
+        media_fields = _media_fields_for_message(msg)
+
+        payload_out = {
+            "type": "room_message",
+            "event": "room_message",
+            "media_kind": media_fields["type"],
+            "room_id": room.id,
+            "id": msg.id,
+            "sender_id": user_id,
+            "sender_username": username,
+            "sender_display_name": display_name_of(u) if u else username,
+            "sender_avatar": u.avatar if u else None,
+            "content": content,
+            "created_at": msg.created_at.isoformat(),
+            "reply_to": reply_preview_of(db, msg),
+            "edited_at": None,
+            "reactions": [],
+        }
+        payload_out.update(media_fields)
+        try:
+            import asyncio
+            asyncio.create_task(manager.broadcast_except(user_id, payload_out))
+        except Exception:
+            pass
+        return
+
+    # Regular DM
+    receiver_id = data.get("to")
+    content = (data.get("content") or "").strip()
+
+    if not receiver_id or not content:
+        return
+
+    receiver = db.query(User).filter(User.id == receiver_id).first()
+    if not receiver:
+        return
+    if receiver.deleted_at is not None:
+        return
+
+    stored_ts = resolve_client_timestamp(data.get("created_at"))
+    reply_to = data.get("reply_to_id")
+
+    if stored_ts is not None:
+        msg = Message(sender_id=user_id, receiver_id=receiver_id,
+                      content=content, created_at=stored_ts,
+                      reply_to_id=reply_to)
+    else:
+        msg = Message(sender_id=user_id, receiver_id=receiver_id,
+                      content=content, reply_to_id=reply_to)
+    db.add(msg)
+    db.commit()
+    db.refresh(msg)
+
+    u = db.query(User).filter(User.id == user_id).first()
+    if u and not u.is_bot:
+        u.last_seen = datetime.utcnow()
+        db.commit()
+
+    media_fields = _media_fields_for_message(msg)
+
+    payload_out = {
+        "id": msg.id,
+        "from": user_id,
+        "from_username": username,
+        "to": receiver_id,
+        "content": content,
+        "created_at": msg.created_at.isoformat(),
+        "read_at": None,
+        "reply_to": reply_preview_of(db, msg),
+        "edited_at": None,
+        "media_kind": media_fields["type"],
+        "reactions": [],
+    }
+    payload_out.update(media_fields)
+
+    try:
+        import asyncio
+        asyncio.create_task(manager.send_to(user_id, payload_out))
+        asyncio.create_task(manager.send_to(receiver_id, payload_out))
+    except Exception:
+        pass
+
+    if receiver.is_bot:
+        try:
+            reply_text = bot_reply(db, u, content)
+            reply_msg = send_bot_message(db, user_id, reply_text)
+            if reply_msg:
+                reply_payload = {
+                    "id": reply_msg.id,
+                    "from": reply_msg.sender_id,
+                    "from_username": BOT_USERNAME,
+                    "to": user_id,
+                    "content": reply_msg.content,
+                    "created_at": reply_msg.created_at.isoformat(),
+                    "read_at": None,
+                    "reply_to": None,
+                    "edited_at": None,
+                    "media_kind": "text",
+                    "type": "text",
+                    "media_url": None,
+                    "thumb_url": None,
+                    "media_name": None,
+                    "media_size": None,
+                    "media_width": None,
+                    "media_height": None,
+                    "media_duration": None,
+                    "reactions": [],
+                }
+                try:
+                    import asyncio
+                    asyncio.create_task(manager.send_to(user_id, reply_payload))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
     payload = decode_token(token)
@@ -2367,6 +2596,7 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
     user_id = int(payload["sub"])
     username = payload["username"]
 
+    # One-time auth check with a short-lived session.
     db0 = SessionLocal()
     try:
         u0 = db0.query(User).filter(User.id == user_id).first()
@@ -2384,205 +2614,23 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
     except Exception as e:
         print(f"[ws] presence_on_connect error: {e!r}")
 
-    db = SessionLocal()
+    # Per-message DB session: opened and closed for each inbound frame.
+    # Nothing is held for the lifetime of the socket.
     try:
-        u = db.query(User).filter(User.id == user_id).first()
-        if u and not u.is_bot:
-            u.last_seen = datetime.utcnow()
-            db.commit()
-
         while True:
             data = await websocket.receive_json()
-            msg_type = (data.get("type") or "message").strip()
-
+            db = SessionLocal()
             try:
-                from features import handle_feature_ws
-                if handle_feature_ws(user_id, username, db, msg_type, data):
-                    continue
-            except Exception as e:
-                print(f"[ws] feature handler error: {e!r}")
-
-            if msg_type in ("typing", "stop_typing"):
-                target = data.get("to")
-                if not target:
-                    continue
-                try:
-                    await manager.send_to(int(target), {
-                        "type": msg_type,
-                        "event": msg_type,
-                        "from": user_id,
-                        "from_username": username,
-                    })
-                except Exception:
-                    pass
-                continue
-
-            if msg_type == "room_message":
-                content = (data.get("content") or "").strip()
-                media_kind = (data.get("media_kind") or "text").strip().lower()
-                media_key = data.get("media_key")
-                media_thumb_key = data.get("media_thumb_key")
-                media_name = data.get("media_name")
-                media_size = data.get("media_size")
-                media_width = data.get("media_width")
-                media_height = data.get("media_height")
-                media_duration = data.get("media_duration")
-
-                if media_kind == "text":
-                    if not content:
-                        continue
-                else:
-                    if not media_key:
-                        continue
-                    if not content:
-                        content = ""
-
-                recent_cutoff = datetime.utcnow() - timedelta(seconds=ROOM_RATE_LIMIT_SECONDS)
-                recent = (db.query(Message)
-                          .filter(Message.sender_id == user_id)
-                          .filter(Message.room_id != None)
-                          .filter(Message.created_at >= recent_cutoff)
-                          .first())
-                if recent is not None:
-                    await manager.send_to(user_id, {
-                        "type": "error",
-                        "event": "error",
-                        "message": "Slow down — one message every few seconds",
-                    })
-                    continue
-
-                room = get_global_room(db)
-                stored_ts = resolve_client_timestamp(data.get("created_at"))
-                reply_to = data.get("reply_to_id")
-
-                msg = Message(
-                    sender_id=user_id,
-                    room_id=room.id,
-                    content=content,
-                    reply_to_id=reply_to,
-                    type=media_kind,
-                    media_key=media_key,
-                    media_thumb_key=media_thumb_key,
-                    media_name=media_name,
-                    media_size=media_size,
-                    media_width=media_width,
-                    media_height=media_height,
-                    media_duration=media_duration,
-                )
-                if stored_ts is not None:
-                    msg.created_at = stored_ts
-
-                db.add(msg)
-                db.commit()
-                db.refresh(msg)
-
+                # Touch last_seen once per message.
                 u = db.query(User).filter(User.id == user_id).first()
                 if u and not u.is_bot:
                     u.last_seen = datetime.utcnow()
                     db.commit()
-
-                media_fields = _media_fields_for_message(msg)
-
-                payload_out = {
-                    "type": "room_message",
-                    "event": "room_message",
-                    "media_kind": media_fields["type"],
-                    "room_id": room.id,
-                    "id": msg.id,
-                    "sender_id": user_id,
-                    "sender_username": username,
-                    "sender_display_name": display_name_of(u) if u else username,
-                    "sender_avatar": u.avatar if u else None,
-                    "content": content,
-                    "created_at": msg.created_at.isoformat(),
-                    "reply_to": reply_preview_of(db, msg),
-                    "edited_at": None,
-                    "reactions": [],
-                }
-                payload_out.update(media_fields)
-                await manager.broadcast_except(user_id, payload_out)
-                continue
-
-            receiver_id = data.get("to")
-            content = (data.get("content") or "").strip()
-
-            if not receiver_id or not content:
-                continue
-
-            receiver = db.query(User).filter(User.id == receiver_id).first()
-            if not receiver:
-                continue
-            if receiver.deleted_at is not None:
-                continue
-
-            stored_ts = resolve_client_timestamp(data.get("created_at"))
-            reply_to = data.get("reply_to_id")
-
-            if stored_ts is not None:
-                msg = Message(sender_id=user_id, receiver_id=receiver_id,
-                              content=content, created_at=stored_ts,
-                              reply_to_id=reply_to)
-            else:
-                msg = Message(sender_id=user_id, receiver_id=receiver_id,
-                              content=content, reply_to_id=reply_to)
-            db.add(msg)
-            db.commit()
-            db.refresh(msg)
-
-            u = db.query(User).filter(User.id == user_id).first()
-            if u and not u.is_bot:
-                u.last_seen = datetime.utcnow()
-                db.commit()
-
-            media_fields = _media_fields_for_message(msg)
-
-            payload_out = {
-                "id": msg.id,
-                "from": user_id,
-                "from_username": username,
-                "to": receiver_id,
-                "content": content,
-                "created_at": msg.created_at.isoformat(),
-                "read_at": None,
-                "reply_to": reply_preview_of(db, msg),
-                "edited_at": None,
-                "media_kind": media_fields["type"],
-                "reactions": [],
-            }
-            payload_out.update(media_fields)
-
-            await manager.send_to(user_id, payload_out)
-            await manager.send_to(receiver_id, payload_out)
-
-            if receiver.is_bot:
-                try:
-                    reply_text = bot_reply(db, u, content)
-                    reply_msg = send_bot_message(db, user_id, reply_text)
-                    if reply_msg:
-                        reply_payload = {
-                            "id": reply_msg.id,
-                            "from": reply_msg.sender_id,
-                            "from_username": BOT_USERNAME,
-                            "to": user_id,
-                            "content": reply_msg.content,
-                            "created_at": reply_msg.created_at.isoformat(),
-                            "read_at": None,
-                            "reply_to": None,
-                            "edited_at": None,
-                            "media_kind": "text",
-                            "type": "text",
-                            "media_url": None,
-                            "thumb_url": None,
-                            "media_name": None,
-                            "media_size": None,
-                            "media_width": None,
-                            "media_height": None,
-                            "media_duration": None,
-                            "reactions": [],
-                        }
-                        await manager.send_to(user_id, reply_payload)
-                except Exception:
-                    pass
+                _ws_handle_message(db, user_id, username, data)
+            except Exception as e:
+                print(f"[ws] handler error for user {user_id}: {e!r}")
+            finally:
+                db.close()
 
     except WebSocketDisconnect:
         manager.disconnect(user_id, websocket)
@@ -2598,8 +2646,6 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
             presence_on_disconnect(user_id)
         except Exception as e:
             print(f"[ws] presence_on_disconnect error: {e!r}")
-    finally:
-        db.close()
 
 
 # ---------------------------------------------------------------------
