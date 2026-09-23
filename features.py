@@ -4,28 +4,32 @@ features.py — Phase A backend additions for Lantern.
 Attaches itself to the app defined in main.py. Exposes:
 - register_features(app)          called once at the bottom of main.py
 - handle_feature_ws(...)          called from the WS loop in main.py
+- reactions_for_message(...)      called by main.py's serializers
+- decorate_message_dict(...)      (media) called by main.py
 
-Contents (Phase A, step 2):
+Contents (Phase A):
 - Backblaze B2 client via the S3-compatible API (boto3)
-- /media/upload endpoint
-- /media/sign endpoint (re-sign expired URLs)
-- Media columns on messages (registered via _ensure_column in main.py)
-- Signed URL injection into message payloads (via main.py's serializers)
+- /media/upload + /media/sign endpoints
+- Media messages (image / file / voice)
+- Message reactions (add / remove / list)
 """
 
 import io
 import os
 import uuid
-from typing import Optional
+from typing import Optional, List
 
 from fastapi import APIRouter, File, UploadFile, HTTPException, Form, Depends
 from pydantic import BaseModel
+from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, UniqueConstraint, func, and_
 from sqlalchemy.orm import Session
 
 # These imports reach into main.py. They only work because
 # register_features() is called at the very bottom of main.py.
 from main import (
     SessionLocal,
+    Base,
+    engine,
     User,
     Message,
     manager,
@@ -57,6 +61,9 @@ MAX_UPLOAD_BYTES = 15 * 1024 * 1024
 IMAGE_TARGET_MAX_DIM = 1600
 IMAGE_JPEG_QUALITY = 82
 THUMB_TARGET_MAX_DIM = 240
+
+# Reactions whitelist. Must match what the client offers.
+ALLOWED_REACTIONS = ["❤️", "😂", "😮", "😢", "👍", "🔥", "🎉"]
 
 
 # ---------------------------------------------------------------------
@@ -95,12 +102,7 @@ def _get_s3():
 
 def upload_bytes(data: bytes, key: str, content_type: str) -> str:
     s3 = _get_s3()
-    s3.put_object(
-        Bucket=B2_BUCKET_NAME,
-        Key=key,
-        Body=data,
-        ContentType=content_type,
-    )
+    s3.put_object(Bucket=B2_BUCKET_NAME, Key=key, Body=data, ContentType=content_type)
     return key
 
 
@@ -109,12 +111,11 @@ def signed_url_for_key(key: Optional[str]) -> Optional[str]:
         return None
     try:
         s3 = _get_s3()
-        url = s3.generate_presigned_url(
+        return s3.generate_presigned_url(
             "get_object",
             Params={"Bucket": B2_BUCKET_NAME, "Key": key},
             ExpiresIn=SIGNED_URL_TTL_SECONDS,
         )
-        return url
     except Exception as e:
         print(f"[features] signed_url_for_key failed for {key}: {e!r}")
         return None
@@ -169,10 +170,63 @@ def _try_compress_image(raw: bytes):
 
 
 # ---------------------------------------------------------------------
-# Routes
+# Reactions model
 # ---------------------------------------------------------------------
 
-router = APIRouter(prefix="/media", tags=["media"])
+class MessageReaction(Base):
+    __tablename__ = "message_reactions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    message_id = Column(Integer, ForeignKey("messages.id"), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    emoji = Column(String(16), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("message_id", "user_id", "emoji", name="uq_reaction_once"),
+    )
+
+
+# Create the table immediately (safe if it already exists).
+try:
+    MessageReaction.__table__.create(bind=engine, checkfirst=True)
+except Exception as e:
+    print(f"[features] could not create message_reactions table: {e!r}")
+
+
+def reactions_for_message(db: Session, message_id: int, me_id: int) -> list:
+    """
+    Group reactions for a message into:
+      [{"emoji": "❤️", "count": 3, "mine": true}, ...]
+    `mine` is True if the current user has reacted with this emoji.
+    """
+    try:
+        rows = (db.query(MessageReaction)
+                .filter(MessageReaction.message_id == message_id)
+                .all())
+    except Exception:
+        return []
+
+    if not rows:
+        return []
+
+    grouped = {}
+    for r in rows:
+        g = grouped.setdefault(r.emoji, {"emoji": r.emoji, "count": 0, "mine": False})
+        g["count"] += 1
+        if r.user_id == me_id:
+            g["mine"] = True
+
+    # Order by the whitelist order so all clients render consistently.
+    order = {e: i for i, e in enumerate(ALLOWED_REACTIONS)}
+    return sorted(grouped.values(), key=lambda x: order.get(x["emoji"], 99))
+
+
+# ---------------------------------------------------------------------
+# Media routes
+# ---------------------------------------------------------------------
+
+media_router = APIRouter(prefix="/media", tags=["media"])
 
 
 class UploadResult(BaseModel):
@@ -189,7 +243,7 @@ class UploadResult(BaseModel):
     duration: Optional[int] = None
 
 
-@router.post("/upload", response_model=UploadResult)
+@media_router.post("/upload", response_model=UploadResult)
 async def upload_media(
     file: UploadFile = File(...),
     kind: str = Form("auto"),
@@ -278,13 +332,8 @@ class SignResponse(BaseModel):
     urls: dict
 
 
-@router.post("/sign", response_model=SignResponse)
+@media_router.post("/sign", response_model=SignResponse)
 def sign_keys(req: SignRequest, user: User = Depends(get_current_user)):
-    """
-    Re-sign a batch of B2 keys. The client can call this if a previously
-    returned signed URL has expired (e.g. after a message was left in
-    the app for more than 7 days).
-    """
     out = {}
     for k in req.keys[:200]:
         url = signed_url_for_key(k)
@@ -314,16 +363,104 @@ def _ext_for_ct(ct: str, original_name: str) -> str:
 
 
 # ---------------------------------------------------------------------
-# Message serialization helpers
+# Reactions routes
 # ---------------------------------------------------------------------
-# These are called from main.py whenever a message row is turned into
-# JSON. They add fresh signed URLs + media metadata to the payload.
+
+reactions_router = APIRouter(tags=["reactions"])
+
+
+class ReactIn(BaseModel):
+    emoji: str
+
+
+@reactions_router.post("/messages/{message_id}/react")
+def react_to_message(message_id: int,
+                     data: ReactIn,
+                     user: User = Depends(get_current_user),
+                     db: Session = Depends(get_db)):
+    emoji = (data.emoji or "").strip()
+    if emoji not in ALLOWED_REACTIONS:
+        raise HTTPException(status_code=400, detail="Emoji not allowed")
+
+    m = db.query(Message).filter(Message.id == message_id).first()
+    if not m:
+        raise HTTPException(status_code=404, detail="Message not found")
+
+    # Can't react to a message that belongs to a DM you're not part of.
+    if m.room_id is None and m.receiver_id is not None:
+        if user.id not in (m.sender_id, m.receiver_id):
+            raise HTTPException(status_code=403, detail="Not your conversation")
+
+    existing = (db.query(MessageReaction)
+                .filter(MessageReaction.message_id == message_id)
+                .filter(MessageReaction.user_id == user.id)
+                .filter(MessageReaction.emoji == emoji)
+                .first())
+
+    action = "add"
+    if existing:
+        db.delete(existing)
+        action = "remove"
+    else:
+        db.add(MessageReaction(message_id=message_id, user_id=user.id, emoji=emoji))
+    db.commit()
+
+    # Group after the change so we can broadcast the fresh count.
+    grouped = reactions_for_message(db, message_id, user.id)
+    this = next((g for g in grouped if g["emoji"] == emoji), {"emoji": emoji, "count": 0, "mine": False})
+
+    payload = {
+        "type": "reaction_changed",
+        "event": "reaction_changed",
+        "message_id": message_id,
+        "emoji": emoji,
+        "user_id": user.id,
+        "action": action,
+        "count": this["count"],
+        "room_id": m.room_id,
+    }
+
+    try:
+        import asyncio
+        if m.room_id is not None:
+            asyncio.create_task(manager.broadcast(payload))
+        else:
+            asyncio.create_task(manager.send_to(m.sender_id, payload))
+            asyncio.create_task(manager.send_to(m.receiver_id, payload))
+    except Exception:
+        pass
+
+    return {
+        "message_id": message_id,
+        "emoji": emoji,
+        "action": action,
+        "count": this["count"],
+        "mine": this["mine"],
+        "reactions": grouped,
+    }
+
+
+@reactions_router.get("/messages/{message_id}/reactions")
+def get_reactions(message_id: int,
+                  user: User = Depends(get_current_user),
+                  db: Session = Depends(get_db)):
+    m = db.query(Message).filter(Message.id == message_id).first()
+    if not m:
+        raise HTTPException(status_code=404, detail="Message not found")
+    if m.room_id is None and m.receiver_id is not None:
+        if user.id not in (m.sender_id, m.receiver_id):
+            raise HTTPException(status_code=403, detail="Not your conversation")
+    return {"reactions": reactions_for_message(db, message_id, user.id)}
+
+
+# ---------------------------------------------------------------------
+# Message serialization helpers (called from main.py)
+# ---------------------------------------------------------------------
 
 def decorate_message_dict(msg: Message, d: dict) -> dict:
     """
-    Given a Message ORM row and a dict that has already been built from it,
-    attach the media fields and a fresh signed URL. The dict is returned
-    unchanged for text messages.
+    Attach media fields (kind, signed URLs, metadata) to a message dict.
+    Text messages get nulls.
     """
     mtype = (getattr(msg, "type", None) or "text")
     d["type"] = mtype
@@ -356,13 +493,11 @@ def handle_feature_ws(user_id: int, username: str, db: Session,
                       msg_type: str, data: dict) -> bool:
     """
     Called from the WS loop in main.py for every incoming WS message.
-    Return True if we handled it, False if main.py should continue with
-    its own logic.
+    Return True if we handled it.
 
-    Media messages still flow through main.py's normal DM / room paths —
-    they're not new WS event types, they just carry extra fields. So
-    right now, nothing to handle here. Future sessions will add reactions,
-    group_message, presence, etc.
+    Reactions travel over REST (POST /messages/{id}/react), not WS —
+    so there's nothing to handle on the WS receive side here yet.
+    Future: presence, group_message, etc.
     """
     return False
 
@@ -373,7 +508,8 @@ def handle_feature_ws(user_id: int, username: str, db: Session,
 
 def register_features(app):
     """Called at the very bottom of main.py."""
-    app.include_router(router)
+    app.include_router(media_router)
+    app.include_router(reactions_router)
 
     @app.on_event("startup")
     def _features_startup():
@@ -382,3 +518,8 @@ def register_features(app):
             print("[features] B2 S3 client warmed up")
         except Exception as e:
             print(f"[features] B2 S3 warmup skipped: {e!r}")
+        try:
+            MessageReaction.__table__.create(bind=engine, checkfirst=True)
+            print("[features] message_reactions table ready")
+        except Exception as e:
+            print(f"[features] message_reactions table create failed: {e!r}")
