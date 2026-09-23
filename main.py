@@ -7,7 +7,7 @@ Includes:
 - Read tracking, soft-delete, typing events
 - WhatsApp-style swipe-to-reply (reply_to_id + reply preview)
 - Edit within 20 minutes + "edited" tag
-- Media messages (image / file / voice) — columns present, endpoints wired
+- Media messages (image / file / voice) — endpoints + WS transport
 - Global Room — one room everyone is in, with unread counts and members list
 - Release / update system + admin panel + broadcast
 - Bot account ("thegoodboy")
@@ -108,7 +108,6 @@ class Message(Base):
     reply_to_id = Column(Integer, ForeignKey("messages.id"), nullable=True)
     edited_at = Column(DateTime(timezone=True), nullable=True)
 
-    # Media columns
     type = Column(String, nullable=False, server_default="text")
     media_key = Column(String, nullable=True)
     media_thumb_key = Column(String, nullable=True)
@@ -281,7 +280,8 @@ def bot_help_text() -> str:
         "• discover — how to find people to talk to\n"
         "• room — about the Global Room\n"
         "• reply — how to reply to a message\n"
-        "• edit — how to edit your own messages\n\n"
+        "• edit — how to edit your own messages\n"
+        "• media — how to send photos and files\n\n"
         "I can't chat freely — I'm just here to help and share announcements."
     )
 
@@ -292,6 +292,15 @@ def bot_reply(db: Session, user: User, text: str) -> str:
     if t in ("help", "hi", "hello", "hey", "start"):
         return bot_help_text()
 
+    if "media" in t or "photo" in t or "image" in t or "picture" in t or "file" in t:
+        return (
+            "To send a photo or file:\n\n"
+            "• Open any chat and tap the attachment icon\n"
+            "• Pick an image or file from your phone\n"
+            "• Add an optional caption, then send\n\n"
+            "You can send photos, files, and voice notes."
+        )
+
     if "room" in t or "global" in t:
         return (
             "The Global Room is one big chat where everyone on Lantern can talk.\n\n"
@@ -300,7 +309,7 @@ def bot_reply(db: Session, user: User, text: str) -> str:
             "• Be kind — everyone can see your messages"
         )
 
-    if "profile" in t or "photo" in t or "avatar" in t or "bio" in t:
+    if "profile" in t or "avatar" in t or "bio" in t:
         return (
             "To edit your profile:\n\n"
             "1. Go to the Chats tab\n"
@@ -504,7 +513,6 @@ class SendMessageIn(BaseModel):
     content: str = ""
     created_at: Optional[str] = None
     reply_to_id: Optional[int] = None
-    # Media (optional). If `type` is not "text", these describe the attachment.
     type: Optional[str] = "text"
     media_key: Optional[str] = None
     media_thumb_key: Optional[str] = None
@@ -746,6 +754,51 @@ def public_view_of(user: User) -> PublicUserOut:
         online=is_online(user) if user.show_online else None,
         last_seen_text=humanize_last_seen(user) if user.show_online else None,
     )
+
+
+def _media_fields_for_message(msg: Message) -> dict:
+    """
+    Build the media-related fields for any message payload (REST or WS).
+    For text messages, everything is None. For media messages, it signs
+    the key into a fresh URL.
+    """
+    try:
+        from features import signed_url_for_key
+    except Exception:
+        signed_url_for_key = None
+
+    kind = (getattr(msg, "type", None) or "text")
+    if kind == "text" or not getattr(msg, "media_key", None):
+        return {
+            "type": "text",
+            "media_url": None,
+            "thumb_url": None,
+            "media_name": getattr(msg, "media_name", None),
+            "media_size": getattr(msg, "media_size", None),
+            "media_width": getattr(msg, "media_width", None),
+            "media_height": getattr(msg, "media_height", None),
+            "media_duration": getattr(msg, "media_duration", None),
+        }
+
+    media_url = None
+    thumb_url = None
+    if signed_url_for_key is not None:
+        try:
+            media_url = signed_url_for_key(msg.media_key)
+            thumb_url = signed_url_for_key(msg.media_thumb_key)
+        except Exception:
+            pass
+
+    return {
+        "type": kind,
+        "media_url": media_url,
+        "thumb_url": thumb_url,
+        "media_name": msg.media_name,
+        "media_size": msg.media_size,
+        "media_width": msg.media_width,
+        "media_height": msg.media_height,
+        "media_duration": msg.media_duration,
+    }
 
 
 # ---------------------------------------------------------------------
@@ -1069,7 +1122,14 @@ def get_global_room_info(user: User = Depends(get_current_user),
         sender = db.query(User).filter(User.id == last.sender_id).first()
         if sender is not None:
             sender_label = "You" if sender.id == user.id else display_name_of(sender)
-            text = last.content
+            text = last.content or ""
+            if not text:
+                if (last.type or "text") == "image":
+                    text = "📷 Photo"
+                elif (last.type or "text") == "voice":
+                    text = "🎤 Voice message"
+                elif (last.type or "text") == "file":
+                    text = "📎 File"
             if len(text) > 80:
                 text = text[:77] + "..."
             preview = f"{sender_label}: {text}"
@@ -1128,13 +1188,6 @@ def get_global_room_messages(limit: int = 40,
             "content": t,
         }
 
-    # Import features' decorator lazily so this module still works if
-    # features.py fails to load.
-    try:
-        from features import decorate_message_dict
-    except Exception:
-        decorate_message_dict = None
-
     out = []
     for m in msgs:
         sender = senders_by_id.get(m.sender_id)
@@ -1149,11 +1202,7 @@ def get_global_room_messages(limit: int = 40,
             "reply_to": build_reply_preview(m),
             "edited_at": m.edited_at.isoformat() if m.edited_at else None,
         }
-        if decorate_message_dict is not None:
-            try:
-                d = decorate_message_dict(m, d)
-            except Exception:
-                pass
+        d.update(_media_fields_for_message(m))
         out.append(d)
     return out
 
@@ -1162,9 +1211,20 @@ def get_global_room_messages(limit: int = 40,
 def post_global_room_message(data: SendRoomMessageIn,
                              user: User = Depends(get_current_user),
                              db: Session = Depends(get_db)):
-    content = data.content.strip()
-    if not content:
-        raise HTTPException(status_code=400, detail="Empty message")
+    msg_type = (data.type or "text").strip().lower()
+    if msg_type not in ("text", "image", "file", "voice"):
+        raise HTTPException(status_code=400, detail="Invalid message type")
+
+    content = (data.content or "").strip()
+
+    if msg_type == "text":
+        if not content:
+            raise HTTPException(status_code=400, detail="Empty message")
+    else:
+        if not data.media_key:
+            raise HTTPException(status_code=400, detail="Media key required")
+        if not content:
+            content = ""
 
     recent_cutoff = datetime.utcnow() - timedelta(seconds=ROOM_RATE_LIMIT_SECONDS)
     recent = (db.query(Message)
@@ -1178,19 +1238,34 @@ def post_global_room_message(data: SendRoomMessageIn,
     room = get_global_room(db)
     stored_ts = resolve_client_timestamp(data.created_at)
 
+    msg = Message(
+        sender_id=user.id,
+        room_id=room.id,
+        content=content,
+        reply_to_id=data.reply_to_id,
+        type=msg_type,
+        media_key=data.media_key,
+        media_thumb_key=data.media_thumb_key,
+        media_name=data.media_name,
+        media_size=data.media_size,
+        media_width=data.media_width,
+        media_height=data.media_height,
+        media_duration=data.media_duration,
+    )
     if stored_ts is not None:
-        msg = Message(sender_id=user.id, room_id=room.id,
-                      content=content, created_at=stored_ts,
-                      reply_to_id=data.reply_to_id)
-    else:
-        msg = Message(sender_id=user.id, room_id=room.id, content=content,
-                      reply_to_id=data.reply_to_id)
+        msg.created_at = stored_ts
+
     db.add(msg)
     db.commit()
     db.refresh(msg)
 
+    media_fields = _media_fields_for_message(msg)
+
+    # ---- WS payload (dual-keyed for old + new clients) ----
     payload_out = {
-        "type": "room_message",
+        "type": "room_message",       # event discriminator (legacy key)
+        "event": "room_message",      # event discriminator (new key)
+        "media_kind": media_fields["type"],
         "room_id": room.id,
         "id": msg.id,
         "sender_id": user.id,
@@ -1201,15 +1276,8 @@ def post_global_room_message(data: SendRoomMessageIn,
         "created_at": msg.created_at.isoformat(),
         "reply_to": reply_preview_of(db, msg),
         "edited_at": None,
-        "type": "text",
-        "media_url": None,
-        "thumb_url": None,
-        "media_name": None,
-        "media_size": None,
-        "media_width": None,
-        "media_height": None,
-        "media_duration": None,
     }
+    payload_out.update(media_fields)
 
     try:
         import asyncio
@@ -1217,18 +1285,19 @@ def post_global_room_message(data: SendRoomMessageIn,
     except Exception:
         pass
 
-    return RoomMessageOut(
-        id=msg.id,
-        sender_id=msg.sender_id,
-        sender_username=user.username,
-        sender_display_name=display_name_of(user),
-        sender_avatar=user.avatar,
-        content=msg.content,
-        created_at=msg.created_at.isoformat(),
-        reply_to=reply_preview_of(db, msg),
-        edited_at=None,
-        type="text",
-    )
+    resp = {
+        "id": msg.id,
+        "sender_id": msg.sender_id,
+        "sender_username": user.username,
+        "sender_display_name": display_name_of(user),
+        "sender_avatar": user.avatar,
+        "content": msg.content,
+        "created_at": msg.created_at.isoformat(),
+        "reply_to": reply_preview_of(db, msg),
+        "edited_at": None,
+    }
+    resp.update(media_fields)
+    return resp
 
 
 @app.post("/rooms/global/read")
@@ -1307,6 +1376,7 @@ def conversations(user: User = Depends(get_current_user),
         if not u:
             continue
         unread = unread_by_user.get(other_id, 0)
+        preview = content or ""
         out.append(ConversationOut(
             user_id=u.id,
             username=u.username,
@@ -1314,7 +1384,7 @@ def conversations(user: User = Depends(get_current_user),
             avatar=(u.avatar if u.deleted_at is None else None),
             is_bot=u.is_bot,
             is_deleted=(u.deleted_at is not None),
-            last_message=content,
+            last_message=preview,
             last_timestamp=created_at.isoformat(),
             online=(is_online(u) if (u.is_bot or u.show_online) else None),
             last_seen_text=(humanize_last_seen(u) if (u.is_bot or u.show_online) else None),
@@ -1339,7 +1409,8 @@ def mark_conversation_read(other_user_id: int,
     try:
         import asyncio
         asyncio.create_task(manager.send_to(other_user_id, {
-            "type": "read",
+            "type": "read",         # legacy
+            "event": "read",        # new
             "by": user.id,
         }))
     except Exception:
@@ -1414,11 +1485,6 @@ def get_messages(other_user_id: int,
             "content": t,
         }
 
-    try:
-        from features import decorate_message_dict
-    except Exception:
-        decorate_message_dict = None
-
     out = []
     for m in msgs:
         d = {
@@ -1431,11 +1497,7 @@ def get_messages(other_user_id: int,
             "reply_to": build_reply_preview(m),
             "edited_at": m.edited_at.isoformat() if m.edited_at else None,
         }
-        if decorate_message_dict is not None:
-            try:
-                d = decorate_message_dict(m, d)
-            except Exception:
-                pass
+        d.update(_media_fields_for_message(m))
         out.append(d)
     return out
 
@@ -1450,8 +1512,6 @@ def post_message(data: SendMessageIn,
 
     content = (data.content or "").strip()
 
-    # Text messages need non-empty content.
-    # Media messages need either content (a caption) or a media_key.
     if msg_type == "text":
         if not content:
             raise HTTPException(status_code=400, detail="Empty message")
@@ -1459,7 +1519,7 @@ def post_message(data: SendMessageIn,
         if not data.media_key:
             raise HTTPException(status_code=400, detail="Media key required")
         if not content:
-            content = ""  # media with no caption is fine
+            content = ""
 
     receiver = db.query(User).filter(User.id == data.to).first()
     if not receiver:
@@ -1490,11 +1550,7 @@ def post_message(data: SendMessageIn,
     db.commit()
     db.refresh(msg)
 
-    # Build the outgoing payload with signed URLs for media messages.
-    try:
-        from features import decorate_message_dict
-    except Exception:
-        decorate_message_dict = None
+    media_fields = _media_fields_for_message(msg)
 
     payload_out = {
         "id": msg.id,
@@ -1506,14 +1562,9 @@ def post_message(data: SendMessageIn,
         "read_at": None,
         "reply_to": reply_preview_of(db, msg),
         "edited_at": None,
+        "media_kind": media_fields["type"],
     }
-    if decorate_message_dict is not None:
-        try:
-            payload_out = decorate_message_dict(msg, payload_out)
-        except Exception:
-            payload_out["type"] = "text"
-    else:
-        payload_out["type"] = "text"
+    payload_out.update(media_fields)
 
     try:
         import asyncio
@@ -1536,6 +1587,7 @@ def post_message(data: SendMessageIn,
                     "read_at": None,
                     "reply_to": None,
                     "edited_at": None,
+                    "media_kind": "text",
                     "type": "text",
                     "media_url": None,
                     "thumb_url": None,
@@ -1563,14 +1615,9 @@ def post_message(data: SendMessageIn,
         "reply_to": reply_preview_of(db, msg),
         "edited_at": None,
     }
-    if decorate_message_dict is not None:
-        try:
-            resp = decorate_message_dict(msg, resp)
-        except Exception:
-            resp["type"] = "text"
-    else:
-        resp["type"] = "text"
+    resp.update(media_fields)
     return resp
+
 
 @app.put("/messages/{message_id}")
 def edit_message(message_id: int,
@@ -1597,7 +1644,8 @@ def edit_message(message_id: int,
         db.refresh(m)
 
     payload_out = {
-        "type": "message_edited",
+        "type": "message_edited",     # legacy
+        "event": "message_edited",    # new
         "id": m.id,
         "content": m.content,
         "edited_at": m.edited_at.isoformat() if m.edited_at else None,
@@ -1749,7 +1797,8 @@ def admin_rename_room(data: RenameRoomIn,
     try:
         import asyncio
         asyncio.create_task(manager.broadcast({
-            "type": "room_renamed",
+            "type": "room_renamed",     # legacy
+            "event": "room_renamed",    # new
             "room_id": room.id,
             "name": room.name,
         }))
@@ -1795,6 +1844,7 @@ def admin_broadcast(data: BroadcastIn,
                         "read_at": None,
                         "reply_to": None,
                         "edited_at": None,
+                        "media_kind": "text",
                         "type": "text",
                         "media_url": None,
                         "thumb_url": None,
@@ -2310,7 +2360,6 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
             data = await websocket.receive_json()
             msg_type = (data.get("type") or "message").strip()
 
-            # Phase A+: let features.py handle its own WS event types.
             try:
                 from features import handle_feature_ws
                 if handle_feature_ws(user_id, username, db, msg_type, data):
@@ -2324,7 +2373,8 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
                     continue
                 try:
                     await manager.send_to(int(target), {
-                        "type": msg_type,
+                        "type": msg_type,       # legacy
+                        "event": msg_type,      # new
                         "from": user_id,
                         "from_username": username,
                     })
@@ -2334,8 +2384,23 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
 
             if msg_type == "room_message":
                 content = (data.get("content") or "").strip()
-                if not content:
-                    continue
+                media_kind = (data.get("media_kind") or "text").strip().lower()
+                media_key = data.get("media_key")
+                media_thumb_key = data.get("media_thumb_key")
+                media_name = data.get("media_name")
+                media_size = data.get("media_size")
+                media_width = data.get("media_width")
+                media_height = data.get("media_height")
+                media_duration = data.get("media_duration")
+
+                if media_kind == "text":
+                    if not content:
+                        continue
+                else:
+                    if not media_key:
+                        continue
+                    if not content:
+                        content = ""
 
                 recent_cutoff = datetime.utcnow() - timedelta(seconds=ROOM_RATE_LIMIT_SECONDS)
                 recent = (db.query(Message)
@@ -2346,6 +2411,7 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
                 if recent is not None:
                     await manager.send_to(user_id, {
                         "type": "error",
+                        "event": "error",
                         "message": "Slow down — one message every few seconds",
                     })
                     continue
@@ -2354,13 +2420,23 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
                 stored_ts = resolve_client_timestamp(data.get("created_at"))
                 reply_to = data.get("reply_to_id")
 
+                msg = Message(
+                    sender_id=user_id,
+                    room_id=room.id,
+                    content=content,
+                    reply_to_id=reply_to,
+                    type=media_kind,
+                    media_key=media_key,
+                    media_thumb_key=media_thumb_key,
+                    media_name=media_name,
+                    media_size=media_size,
+                    media_width=media_width,
+                    media_height=media_height,
+                    media_duration=media_duration,
+                )
                 if stored_ts is not None:
-                    msg = Message(sender_id=user_id, room_id=room.id,
-                                  content=content, created_at=stored_ts,
-                                  reply_to_id=reply_to)
-                else:
-                    msg = Message(sender_id=user_id, room_id=room.id, content=content,
-                                  reply_to_id=reply_to)
+                    msg.created_at = stored_ts
+
                 db.add(msg)
                 db.commit()
                 db.refresh(msg)
@@ -2370,8 +2446,12 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
                     u.last_seen = datetime.utcnow()
                     db.commit()
 
+                media_fields = _media_fields_for_message(msg)
+
                 payload_out = {
                     "type": "room_message",
+                    "event": "room_message",
+                    "media_kind": media_fields["type"],
                     "room_id": room.id,
                     "id": msg.id,
                     "sender_id": user_id,
@@ -2382,15 +2462,8 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
                     "created_at": msg.created_at.isoformat(),
                     "reply_to": reply_preview_of(db, msg),
                     "edited_at": None,
-                    "type": "text",
-                    "media_url": None,
-                    "thumb_url": None,
-                    "media_name": None,
-                    "media_size": None,
-                    "media_width": None,
-                    "media_height": None,
-                    "media_duration": None,
                 }
+                payload_out.update(media_fields)
                 await manager.broadcast_except(user_id, payload_out)
                 continue
 
@@ -2425,6 +2498,8 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
                 u.last_seen = datetime.utcnow()
                 db.commit()
 
+            media_fields = _media_fields_for_message(msg)
+
             payload_out = {
                 "id": msg.id,
                 "from": user_id,
@@ -2435,15 +2510,9 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
                 "read_at": None,
                 "reply_to": reply_preview_of(db, msg),
                 "edited_at": None,
-                "type": "text",
-                "media_url": None,
-                "thumb_url": None,
-                "media_name": None,
-                "media_size": None,
-                "media_width": None,
-                "media_height": None,
-                "media_duration": None,
+                "media_kind": media_fields["type"],
             }
+            payload_out.update(media_fields)
 
             await manager.send_to(user_id, payload_out)
             await manager.send_to(receiver_id, payload_out)
@@ -2463,6 +2532,7 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
                             "read_at": None,
                             "reply_to": None,
                             "edited_at": None,
+                            "media_kind": "text",
                             "type": "text",
                             "media_url": None,
                             "thumb_url": None,
