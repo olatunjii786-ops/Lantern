@@ -939,15 +939,6 @@ def post_welcome_in_room(new_user_id: int, new_username: str):
 # Debug/admin: manual trigger of the daily quote
 # ---------------------------------------------------------------------
 
-debug_router = APIRouter(tags=["debug"])
-
-
-@debug_router.post("/debug/run-daily-quote")
-def debug_run_daily_quote():
-    """Manually trigger the daily quote post. Useful for testing."""
-    success = post_daily_quote_once()
-    return {"ok": success}
-
 
 # ---------------------------------------------------------------------
 # Message serialization helpers (called from main.py)
@@ -999,7 +990,6 @@ def register_features(app):
     app.include_router(media_router)
     app.include_router(reactions_router)
     app.include_router(presence_router)
-    app.include_router(debug_router)
 
     @app.on_event("startup")
     def _features_startup():
