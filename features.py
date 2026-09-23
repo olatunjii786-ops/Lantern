@@ -461,6 +461,7 @@ def get_reactions(message_id: int,
 # ---------------------------------------------------------------------
 
 def online_user_ids() -> list:
+    """Return the list of user ids with at least one live WS socket."""
     try:
         return [uid for uid, socks in manager.active.items() if socks]
     except Exception:
@@ -494,10 +495,16 @@ def room_presence(user: User = Depends(get_current_user),
     return {"online": out, "count": len(out)}
 
 
-async def _broadcast_presence(db: Session):
+async def _broadcast_presence():
+    """
+    Push the current online roster to every connected socket.
+    Opens its own DB session inside the async task, uses it, closes it.
+    No session ever crosses an async boundary, so no connections leak.
+    """
     ids = online_user_ids()
     users = []
     if ids:
+        db = SessionLocal()
         try:
             rows = (db.query(User)
                     .filter(User.id.in_(ids))
@@ -506,8 +513,12 @@ async def _broadcast_presence(db: Session):
                     .all())
             users = [{"id": u.id, "username": u.username, "avatar": u.avatar}
                      for u in rows]
-        except Exception:
+        except Exception as e:
+            print(f"[features] presence query failed: {e!r}")
             users = []
+        finally:
+            db.close()
+
     payload = {
         "type": "presence_changed",
         "event": "presence_changed",
@@ -521,29 +532,23 @@ async def _broadcast_presence(db: Session):
 
 
 def presence_on_connect(user_id: int):
-    db = SessionLocal()
+    """Fire-and-forget presence broadcast. Owns no session."""
     try:
-        asyncio.create_task(_broadcast_presence(db))
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            loop.create_task(_broadcast_presence())
     except Exception as e:
         print(f"[features] presence_on_connect failed: {e!r}")
-    finally:
-        try:
-            db.close()
-        except Exception:
-            pass
 
 
 def presence_on_disconnect(user_id: int):
-    db = SessionLocal()
+    """Fire-and-forget presence broadcast. Owns no session."""
     try:
-        asyncio.create_task(_broadcast_presence(db))
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            loop.create_task(_broadcast_presence())
     except Exception as e:
         print(f"[features] presence_on_disconnect failed: {e!r}")
-    finally:
-        try:
-            db.close()
-        except Exception:
-            pass
 
 
 # ---------------------------------------------------------------------
@@ -629,11 +634,8 @@ def _wrap_text(text: str, font, max_width: int, draw):
     return lines
 
 
-def _draw_lantern(size: int, body_rgb, glow_rgb) -> "object":
-    """
-    Draw a lantern as a transparent PIL Image of the given square size.
-    Returns an RGBA Image.
-    """
+def _draw_lantern(size: int, body_rgb, glow_rgb):
+    """Draw a lantern as a transparent RGBA PIL Image of the given square size."""
     from PIL import Image, ImageDraw
 
     img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
@@ -659,7 +661,7 @@ def _draw_lantern(size: int, body_rgb, glow_rgb) -> "object":
         width=handle_w,
     )
 
-    # Body — a soft glowing circle
+    # Body — soft glowing circle
     for i in range(40, 0, -1):
         rr = r * i / 40
         t = i / 40.0
@@ -688,7 +690,7 @@ def _draw_lantern(size: int, body_rgb, glow_rgb) -> "object":
     return img
 
 
-def _draw_rising_sun(size: int, sun_rgb) -> "object":
+def _draw_rising_sun(size: int, sun_rgb):
     """Draw a simple rising sun with rays as an RGBA image."""
     from PIL import Image, ImageDraw
     import math
@@ -717,7 +719,7 @@ def _draw_rising_sun(size: int, sun_rgb) -> "object":
                fill=(sun_rgb[0], sun_rgb[1], sun_rgb[2], 255),
                width=ray_w)
 
-    # Horizon bar (ground line)
+    # Horizon bar
     ground_y = cy + r + size * 0.06
     d.rounded_rectangle(
         [cx - size * 0.32, ground_y, cx + size * 0.32, ground_y + max(3, size * 0.03)],
@@ -732,7 +734,7 @@ def _draw_quote_card(quote_text: str, author: str, weekday: int) -> bytes:
     """
     Render a Lantern-themed quote card and return JPEG bytes.
     Layout:
-      - gradient background with a soft radial glow
+      - gradient background with soft radial glow
       - large faint lantern watermark behind the quote
       - small drawn sun + "Good morning, Lantern" header
       - quote centered, author below
@@ -753,7 +755,7 @@ def _draw_quote_card(quote_text: str, author: str, weekday: int) -> bytes:
         b = int(top_rgb[2] * (1 - t) + bot_rgb[2] * t)
         draw.line([(0, y), (W, y)], fill=(r, g, b))
 
-    # Soft radial glow near the top
+    # Soft radial glow
     glow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     gd = ImageDraw.Draw(glow)
     cx, cy, radius = int(W * 0.5), int(H * 0.28), int(W * 0.60)
@@ -765,10 +767,9 @@ def _draw_quote_card(quote_text: str, author: str, weekday: int) -> bytes:
                    fill=(glow_rgb[0], glow_rgb[1], glow_rgb[2], alpha))
     img = Image.alpha_composite(img.convert("RGBA"), glow).convert("RGB")
 
-    # ---------- Big faint lantern watermark behind the quote ----------
+    # Big faint lantern watermark
     wm_size = int(W * 0.85)
     wm = _draw_lantern(wm_size, lantern_rgb, glow_rgb)
-    # Drop the alpha to make it a subtle background mark
     alpha = wm.split()[3]
     alpha = alpha.point(lambda a: int(a * 0.16))
     wm.putalpha(alpha)
@@ -779,7 +780,7 @@ def _draw_quote_card(quote_text: str, author: str, weekday: int) -> bytes:
     img = base.convert("RGB")
     draw = ImageDraw.Draw(img)
 
-    # ---------- Header: small sun + "Good morning, Lantern" ----------
+    # Header: small sun + "Good morning, Lantern"
     header_font = _load_font(36, bold=True)
     sun_size = 60
     sun_img = _draw_rising_sun(sun_size, (255, 235, 190))
@@ -808,7 +809,7 @@ def _draw_quote_card(quote_text: str, author: str, weekday: int) -> bytes:
         fill=(255, 255, 255),
     )
 
-    # ---------- Quote text ----------
+    # Quote text
     quote_font = _load_font(72, bold=False)
     author_font = _load_font(42, bold=False)
 
@@ -823,14 +824,13 @@ def _draw_quote_card(quote_text: str, author: str, weekday: int) -> bytes:
             lw = draw.textlength(line, font=quote_font)
         except Exception:
             lw = len(line) * 36
-        # soft shadow for readability over the watermark
         draw.text(((W - lw) / 2 + 2, y + 2), line,
                   font=quote_font, fill=(0, 0, 0, 120))
         draw.text(((W - lw) / 2, y), line,
                   font=quote_font, fill=(255, 255, 255))
         y += line_h
 
-    # ---------- Author ----------
+    # Author
     author_line = f"— {author}"
     try:
         aw = draw.textlength(author_line, font=author_font)
@@ -839,7 +839,7 @@ def _draw_quote_card(quote_text: str, author: str, weekday: int) -> bytes:
     draw.text(((W - aw) / 2, y + 50), author_line,
               font=author_font, fill=(235, 235, 245))
 
-    # ---------- Attribution ----------
+    # Attribution
     attr = "Powered by ZenQuotes"
     attr_font = _load_font(22, bold=False)
     try:
@@ -1075,7 +1075,6 @@ def register_features(app):
     app.include_router(media_router)
     app.include_router(reactions_router)
     app.include_router(presence_router)
-    
 
     @app.on_event("startup")
     def _features_startup():
