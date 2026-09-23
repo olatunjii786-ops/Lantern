@@ -120,27 +120,30 @@ def upload_bytes(data: bytes, key: str, content_type: str) -> str:
 def signed_url_for_key(key: str) -> Optional[str]:
     """
     Return a temporary download URL for a private bucket key.
-    The URL expires in SIGNED_URL_TTL_SECONDS (7 days by default).
+    Uses b2sdk's built-in presigned URL generator, which works with
+    both v2 and v3 of the SDK.
     """
     if not key:
         return None
     try:
         api, bucket = _get_b2()
-        # b2_get_download_authorization gives us a token valid for the given
-        # duration, for a specific file prefix. We pass the exact key so it
-        # only works for that one file.
-        auth = api.get_download_authorization(
-            bucket_name=bucket.name,
-            file_name_prefix=key,
-            valid_duration_in_seconds=SIGNED_URL_TTL_SECONDS,
-        )
-        base = bucket.get_download_url(key)
-        # base is a full URL; append the auth token as a query parameter.
-        sep = "&" if "?" in base else "?"
-        return f"{base}{sep}Authorization={auth}"
-    except Exception:
+        # b2sdk's get_download_url_for_file_name with an auth token is the
+        # supported way to generate a temporary URL for a private file.
+        # In most v2 versions the signature is (file_name, valid_duration).
+        try:
+            url = bucket.get_download_url_for_file_name(
+                key, valid_duration_in_seconds=SIGNED_URL_TTL_SECONDS
+            )
+        except TypeError:
+            # Older v2 signature: (file_name, valid_duration)
+            url = bucket.get_download_url_for_file_name(
+                key, SIGNED_URL_TTL_SECONDS
+            )
+        return url
+    except Exception as e:
+        # Print so we can see it in Render logs if it ever fails again.
+        print(f"[features] signed_url_for_key failed for {key}: {e!r}")
         return None
-
 
 # ---------------------------------------------------------------------
 # Image helpers
