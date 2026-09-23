@@ -501,15 +501,32 @@ class RoomMemberOut(BaseModel):
 
 class SendMessageIn(BaseModel):
     to: int
-    content: str
+    content: str = ""
     created_at: Optional[str] = None
     reply_to_id: Optional[int] = None
+    # Media (optional). If `type` is not "text", these describe the attachment.
+    type: Optional[str] = "text"
+    media_key: Optional[str] = None
+    media_thumb_key: Optional[str] = None
+    media_name: Optional[str] = None
+    media_size: Optional[int] = None
+    media_width: Optional[int] = None
+    media_height: Optional[int] = None
+    media_duration: Optional[int] = None
 
 
 class SendRoomMessageIn(BaseModel):
-    content: str
+    content: str = ""
     created_at: Optional[str] = None
     reply_to_id: Optional[int] = None
+    type: Optional[str] = "text"
+    media_key: Optional[str] = None
+    media_thumb_key: Optional[str] = None
+    media_name: Optional[str] = None
+    media_size: Optional[int] = None
+    media_width: Optional[int] = None
+    media_height: Optional[int] = None
+    media_duration: Optional[int] = None
 
 
 class MessageOut(BaseModel):
@@ -1427,8 +1444,22 @@ def get_messages(other_user_id: int,
 def post_message(data: SendMessageIn,
                  user: User = Depends(get_current_user),
                  db: Session = Depends(get_db)):
-    if not data.content.strip():
-        raise HTTPException(status_code=400, detail="Empty message")
+    msg_type = (data.type or "text").strip().lower()
+    if msg_type not in ("text", "image", "file", "voice"):
+        raise HTTPException(status_code=400, detail="Invalid message type")
+
+    content = (data.content or "").strip()
+
+    # Text messages need non-empty content.
+    # Media messages need either content (a caption) or a media_key.
+    if msg_type == "text":
+        if not content:
+            raise HTTPException(status_code=400, detail="Empty message")
+    else:
+        if not data.media_key:
+            raise HTTPException(status_code=400, detail="Media key required")
+        if not content:
+            content = ""  # media with no caption is fine
 
     receiver = db.query(User).filter(User.id == data.to).first()
     if not receiver:
@@ -1438,16 +1469,32 @@ def post_message(data: SendMessageIn,
 
     stored_ts = resolve_client_timestamp(data.created_at)
 
+    msg = Message(
+        sender_id=user.id,
+        receiver_id=data.to,
+        content=content,
+        reply_to_id=data.reply_to_id,
+        type=msg_type,
+        media_key=data.media_key,
+        media_thumb_key=data.media_thumb_key,
+        media_name=data.media_name,
+        media_size=data.media_size,
+        media_width=data.media_width,
+        media_height=data.media_height,
+        media_duration=data.media_duration,
+    )
     if stored_ts is not None:
-        msg = Message(sender_id=user.id, receiver_id=data.to,
-                      content=data.content.strip(), created_at=stored_ts,
-                      reply_to_id=data.reply_to_id)
-    else:
-        msg = Message(sender_id=user.id, receiver_id=data.to,
-                      content=data.content.strip(), reply_to_id=data.reply_to_id)
+        msg.created_at = stored_ts
+
     db.add(msg)
     db.commit()
     db.refresh(msg)
+
+    # Build the outgoing payload with signed URLs for media messages.
+    try:
+        from features import decorate_message_dict
+    except Exception:
+        decorate_message_dict = None
 
     payload_out = {
         "id": msg.id,
@@ -1459,15 +1506,15 @@ def post_message(data: SendMessageIn,
         "read_at": None,
         "reply_to": reply_preview_of(db, msg),
         "edited_at": None,
-        "type": "text",
-        "media_url": None,
-        "thumb_url": None,
-        "media_name": None,
-        "media_size": None,
-        "media_width": None,
-        "media_height": None,
-        "media_duration": None,
     }
+    if decorate_message_dict is not None:
+        try:
+            payload_out = decorate_message_dict(msg, payload_out)
+        except Exception:
+            payload_out["type"] = "text"
+    else:
+        payload_out["type"] = "text"
+
     try:
         import asyncio
         asyncio.create_task(manager.send_to(data.to, payload_out))
@@ -1476,7 +1523,7 @@ def post_message(data: SendMessageIn,
 
     if receiver.is_bot:
         try:
-            reply_text = bot_reply(db, user, data.content.strip())
+            reply_text = bot_reply(db, user, content)
             reply_msg = send_bot_message(db, user.id, reply_text)
             if reply_msg:
                 reply_payload = {
@@ -1506,18 +1553,24 @@ def post_message(data: SendMessageIn,
         except Exception:
             pass
 
-    return MessageOut(
-        id=msg.id,
-        sender_id=msg.sender_id,
-        receiver_id=msg.receiver_id,
-        content=msg.content,
-        created_at=msg.created_at.isoformat(),
-        read_at=None,
-        reply_to=reply_preview_of(db, msg),
-        edited_at=None,
-        type="text",
-    )
-
+    resp = {
+        "id": msg.id,
+        "sender_id": msg.sender_id,
+        "receiver_id": msg.receiver_id,
+        "content": msg.content,
+        "created_at": msg.created_at.isoformat(),
+        "read_at": None,
+        "reply_to": reply_preview_of(db, msg),
+        "edited_at": None,
+    }
+    if decorate_message_dict is not None:
+        try:
+            resp = decorate_message_dict(msg, resp)
+        except Exception:
+            resp["type"] = "text"
+    else:
+        resp["type"] = "text"
+    return resp
 
 @app.put("/messages/{message_id}")
 def edit_message(message_id: int,
