@@ -120,27 +120,28 @@ def upload_bytes(data: bytes, key: str, content_type: str) -> str:
 def signed_url_for_key(key: str) -> Optional[str]:
     """
     Return a temporary download URL for a private bucket key.
-    Uses b2_get_download_authorization + the account download URL.
+    Uses b2sdk's built-in methods: get_download_url_for_file_name on B2Api,
+    and get_download_authorization on Bucket.
     """
     if not key:
         return None
     try:
         api, bucket = _get_b2()
 
-        # 1) Get the download authorization token for this exact file.
-        auth = api.get_download_authorization(
-            bucket_name=bucket.name,
-            file_name_prefix=key,
-            valid_duration_in_seconds=SIGNED_URL_TTL_SECONDS,
+        # 1) Get the base download URL from the API (not the bucket).
+        #    This is the correct method per b2sdk v2 docs.
+        base_url = api.get_download_url_for_file_name(bucket.name, key)
+
+        # 2) Get the auth token from the bucket.
+        #    The signature is (bucket_id, file_name_prefix, valid_duration_in_seconds).
+        auth = bucket.get_download_authorization(
+            bucket.id_,
+            key,
+            SIGNED_URL_TTL_SECONDS
         )
 
-        # 2) Build the base download URL from the account info.
-        #    This is the correct place to get it from.
-        download_url = api.account_info.get_download_url()
-
-        # 3) Assemble the final URL. The file name must be URL-encoded.
-        from urllib.parse import quote
-        return f"{download_url}/file/{bucket.name}/{quote(key)}?Authorization={auth}"
+        # 3) Assemble the final URL.
+        return f"{base_url}?Authorization={auth}"
 
     except Exception as e:
         print(f"[features] signed_url_for_key failed for {key}: {e!r}")
