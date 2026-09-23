@@ -1,15 +1,16 @@
 """
 features.py — Phase A backend additions for Lantern.
 
-This module attaches itself to the app defined in main.py. It imports
-shared pieces (SessionLocal, models, manager, helpers) from main.py,
-and exposes a single `register_features(app)` function that main.py
-calls at the very bottom of the file.
+Attaches itself to the app defined in main.py. Exposes:
+- register_features(app)          called once at the bottom of main.py
+- handle_feature_ws(...)          called from the WS loop in main.py
 
-Contents (Phase A, step 1):
+Contents (Phase A, step 2):
 - Backblaze B2 client via the S3-compatible API (boto3)
 - /media/upload endpoint
-- image compression / thumbnail generation (optional, via Pillow)
+- /media/sign endpoint (re-sign expired URLs)
+- Media columns on messages (registered via _ensure_column in main.py)
+- Signed URL injection into message payloads (via main.py's serializers)
 """
 
 import io
@@ -19,10 +20,10 @@ from typing import Optional
 
 from fastapi import APIRouter, File, UploadFile, HTTPException, Form, Depends
 from pydantic import BaseModel
+from sqlalchemy.orm import Session
 
 # These imports reach into main.py. They only work because
-# register_features() is called at the very bottom of main.py,
-# after everything in that file is defined.
+# register_features() is called at the very bottom of main.py.
 from main import (
     SessionLocal,
     User,
@@ -30,9 +31,6 @@ from main import (
     manager,
     get_current_user,
     get_db,
-    display_name_of,
-    reply_preview_of,
-    resolve_client_timestamp,
 )
 
 # ---------------------------------------------------------------------
@@ -45,7 +43,6 @@ B2_BUCKET_NAME = os.environ.get("B2_BUCKET_NAME")
 B2_BUCKET_ID = os.environ.get("B2_BUCKET_ID")
 B2_REGION = os.environ.get("B2_REGION", "us-west-004")
 
-# B2_ENDPOINT should be the S3 hostname, e.g. "s3.us-west-004.backblazeb2.com"
 _b2_endpoint_raw = os.environ.get("B2_ENDPOINT", "")
 if _b2_endpoint_raw and not _b2_endpoint_raw.startswith("http"):
     B2_ENDPOINT_URL = "https://" + _b2_endpoint_raw
@@ -54,11 +51,10 @@ elif _b2_endpoint_raw:
 else:
     B2_ENDPOINT_URL = ""
 
-# Signed URL lifetime (7 days)
 SIGNED_URL_TTL_SECONDS = 7 * 24 * 60 * 60
 
-MAX_UPLOAD_BYTES = 15 * 1024 * 1024       # 15 MB hard cap
-IMAGE_TARGET_MAX_DIM = 1600               # compress images to fit this
+MAX_UPLOAD_BYTES = 15 * 1024 * 1024
+IMAGE_TARGET_MAX_DIM = 1600
 IMAGE_JPEG_QUALITY = 82
 THUMB_TARGET_MAX_DIM = 240
 
@@ -74,7 +70,6 @@ _s3_client = None
 
 
 def _get_s3():
-    """Lazy-init the S3 client pointed at B2. Reused across requests."""
     global _s3_client
     if _s3_client is not None:
         return _s3_client
@@ -99,7 +94,6 @@ def _get_s3():
 
 
 def upload_bytes(data: bytes, key: str, content_type: str) -> str:
-    """Upload raw bytes to B2. Returns the key."""
     s3 = _get_s3()
     s3.put_object(
         Bucket=B2_BUCKET_NAME,
@@ -110,11 +104,7 @@ def upload_bytes(data: bytes, key: str, content_type: str) -> str:
     return key
 
 
-def signed_url_for_key(key: str) -> Optional[str]:
-    """
-    Return a temporary download URL for a private bucket key.
-    Uses S3 presigned URLs (boto3), which works reliably across versions.
-    """
+def signed_url_for_key(key: Optional[str]) -> Optional[str]:
     if not key:
         return None
     try:
@@ -130,8 +120,7 @@ def signed_url_for_key(key: str) -> Optional[str]:
         return None
 
 
-def delete_key(key: str) -> bool:
-    """Delete a single object. Used later for message deletion cleanup."""
+def delete_key(key: Optional[str]) -> bool:
     if not key:
         return False
     try:
@@ -144,29 +133,20 @@ def delete_key(key: str) -> bool:
 
 
 # ---------------------------------------------------------------------
-# Image helpers (optional, only if Pillow is installed)
+# Image helpers
 # ---------------------------------------------------------------------
 
-def _try_compress_image(raw: bytes, content_type: str):
-    """
-    If the upload is an image and Pillow is available, resize and re-encode
-    to a JPEG. Also produce a small thumbnail.
-
-    Returns (main_bytes, main_ct, thumb_bytes, thumb_ct, width, height)
-    or None if compression couldn't be attempted.
-    """
+def _try_compress_image(raw: bytes):
     try:
         from PIL import Image
     except Exception:
         return None
-
     try:
         img = Image.open(io.BytesIO(raw))
         img.load()
     except Exception:
         return None
 
-    # Main image
     main_img = img.copy()
     main_img.thumbnail((IMAGE_TARGET_MAX_DIM, IMAGE_TARGET_MAX_DIM))
     main_w, main_h = main_img.size
@@ -177,7 +157,6 @@ def _try_compress_image(raw: bytes, content_type: str):
     main_img.save(main_buf, format="JPEG", quality=IMAGE_JPEG_QUALITY, optimize=True)
     main_bytes = main_buf.getvalue()
 
-    # Thumbnail
     thumb = img.copy()
     thumb.thumbnail((THUMB_TARGET_MAX_DIM, THUMB_TARGET_MAX_DIM))
     if thumb.mode in ("RGBA", "P", "LA"):
@@ -203,24 +182,19 @@ class UploadResult(BaseModel):
     thumb_url: Optional[str] = None
     media_name: str
     media_size: int
-    media_type: str          # "image" | "file" | "voice"
+    media_type: str
     content_type: str
     width: Optional[int] = None
     height: Optional[int] = None
-    duration: Optional[float] = None
+    duration: Optional[int] = None
 
 
 @router.post("/upload", response_model=UploadResult)
 async def upload_media(
     file: UploadFile = File(...),
-    kind: str = Form("auto"),     # "image" | "file" | "voice" | "auto"
+    kind: str = Form("auto"),
     user: User = Depends(get_current_user),
 ):
-    """
-    Accept a multipart file upload, push it to B2, return a media key
-    and a signed URL. Does NOT create a message — the client then POSTs
-    a message with the returned media_key.
-    """
     if not (B2_KEY_ID and B2_APP_KEY and B2_ENDPOINT_URL and B2_BUCKET_NAME):
         raise HTTPException(status_code=503, detail="Media storage not configured")
 
@@ -245,7 +219,6 @@ async def upload_media(
         else:
             kind = "file"
 
-    # ---- Images: try to compress + thumbnail ----
     main_bytes = raw
     main_ct = declared_ct or "application/octet-stream"
     thumb_bytes = None
@@ -254,23 +227,20 @@ async def upload_media(
     height = None
 
     if kind == "image":
-        compressed = _try_compress_image(raw, declared_ct)
+        compressed = _try_compress_image(raw)
         if compressed:
             main_bytes, main_ct, thumb_bytes, thumb_ct, width, height = compressed
 
-    # ---- Build unique keys ----
     ext = _ext_for_ct(main_ct, original_name)
     key = f"media/{user.id}/{uuid.uuid4().hex}{ext}"
     thumb_key = None
 
-    # ---- Upload main file ----
     try:
         upload_bytes(main_bytes, key, main_ct)
     except Exception as e:
         print(f"[features] upload failed: {e!r}")
         raise HTTPException(status_code=502, detail=f"Upload failed: {e}")
 
-    # ---- Upload thumbnail (best effort) ----
     if thumb_bytes is not None:
         thumb_key = f"media/{user.id}/thumbs/{uuid.uuid4().hex}.jpg"
         try:
@@ -279,7 +249,6 @@ async def upload_media(
             print(f"[features] thumb upload failed: {e!r}")
             thumb_key = None
 
-    # ---- Generate signed URLs ----
     media_url = signed_url_for_key(key)
     thumb_url = signed_url_for_key(thumb_key) if thumb_key else None
 
@@ -301,6 +270,29 @@ async def upload_media(
     )
 
 
+class SignRequest(BaseModel):
+    keys: list[str]
+
+
+class SignResponse(BaseModel):
+    urls: dict
+
+
+@router.post("/sign", response_model=SignResponse)
+def sign_keys(req: SignRequest, user: User = Depends(get_current_user)):
+    """
+    Re-sign a batch of B2 keys. The client can call this if a previously
+    returned signed URL has expired (e.g. after a message was left in
+    the app for more than 7 days).
+    """
+    out = {}
+    for k in req.keys[:200]:
+        url = signed_url_for_key(k)
+        if url:
+            out[k] = url
+    return SignResponse(urls=out)
+
+
 def _ext_for_ct(ct: str, original_name: str) -> str:
     ct = (ct or "").lower()
     if ct == "image/jpeg": return ".jpg"
@@ -319,6 +311,60 @@ def _ext_for_ct(ct: str, original_name: str) -> str:
         if 2 <= len(ext) <= 6 and ext.isprintable():
             return ext
     return ".bin"
+
+
+# ---------------------------------------------------------------------
+# Message serialization helpers
+# ---------------------------------------------------------------------
+# These are called from main.py whenever a message row is turned into
+# JSON. They add fresh signed URLs + media metadata to the payload.
+
+def decorate_message_dict(msg: Message, d: dict) -> dict:
+    """
+    Given a Message ORM row and a dict that has already been built from it,
+    attach the media fields and a fresh signed URL. The dict is returned
+    unchanged for text messages.
+    """
+    mtype = (getattr(msg, "type", None) or "text")
+    d["type"] = mtype
+
+    if mtype == "text" or not getattr(msg, "media_key", None):
+        d["media_url"] = None
+        d["thumb_url"] = None
+        d["media_name"] = getattr(msg, "media_name", None)
+        d["media_size"] = getattr(msg, "media_size", None)
+        d["media_width"] = getattr(msg, "media_width", None)
+        d["media_height"] = getattr(msg, "media_height", None)
+        d["media_duration"] = getattr(msg, "media_duration", None)
+        return d
+
+    d["media_url"] = signed_url_for_key(msg.media_key)
+    d["thumb_url"] = signed_url_for_key(msg.media_thumb_key)
+    d["media_name"] = msg.media_name
+    d["media_size"] = msg.media_size
+    d["media_width"] = msg.media_width
+    d["media_height"] = msg.media_height
+    d["media_duration"] = msg.media_duration
+    return d
+
+
+# ---------------------------------------------------------------------
+# WebSocket dispatch — called from main.py
+# ---------------------------------------------------------------------
+
+def handle_feature_ws(user_id: int, username: str, db: Session,
+                      msg_type: str, data: dict) -> bool:
+    """
+    Called from the WS loop in main.py for every incoming WS message.
+    Return True if we handled it, False if main.py should continue with
+    its own logic.
+
+    Media messages still flow through main.py's normal DM / room paths —
+    they're not new WS event types, they just carry extra fields. So
+    right now, nothing to handle here. Future sessions will add reactions,
+    group_message, presence, etc.
+    """
+    return False
 
 
 # ---------------------------------------------------------------------
