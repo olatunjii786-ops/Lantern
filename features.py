@@ -943,10 +943,8 @@ debug_router = APIRouter(tags=["debug"])
 
 
 @debug_router.post("/debug/run-daily-quote")
-def debug_run_daily_quote(user: User = Depends(get_current_user)):
+def debug_run_daily_quote():
     """Manually trigger the daily quote post. Useful for testing."""
-    if user.is_bot:
-        raise HTTPException(status_code=403, detail="Bots can't trigger this")
     success = post_daily_quote_once()
     return {"ok": success}
 
