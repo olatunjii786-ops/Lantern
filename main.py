@@ -6,7 +6,6 @@ Includes:
 - Auth, profile, discover, search, conversations, messages
 - Read tracking, soft-delete, typing events
 - WhatsApp-style swipe-to-reply (reply_to_id + reply preview)
-- Edit within 20 minutes + "edited" tag
 - Global Room — one room everyone is in, with unread counts and members list
 - Release / update system + admin panel + broadcast
 - Bot account ("thegoodboy")
@@ -40,7 +39,6 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7
 ONLINE_WINDOW_SECONDS = 300
 MAX_AVATAR_BYTES = 200_000
 ROOM_RATE_LIMIT_SECONDS = 2
-EDIT_WINDOW_SECONDS = 20 * 60
 
 BOT_USERNAME = "thegoodboy"
 BOT_BIO = "Your guide to Lantern. I welcome new users, post announcements, and answer app questions. I'm a bot — not a person. Type 'help' any time."
@@ -103,7 +101,6 @@ class Message(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     read_at = Column(DateTime(timezone=True), nullable=True)
     reply_to_id = Column(Integer, ForeignKey("messages.id"), nullable=True)
-    edited_at = Column(DateTime(timezone=True), nullable=True)
 
     sender = relationship("User", foreign_keys=[sender_id])
     receiver = relationship("User", foreign_keys=[receiver_id])
@@ -147,8 +144,8 @@ _ensure_column("users", "room_last_read_at", "TIMESTAMP WITH TIME ZONE")
 _ensure_column("messages", "read_at", "TIMESTAMP WITH TIME ZONE")
 _ensure_column("messages", "room_id", "INTEGER")
 _ensure_column("messages", "reply_to_id", "INTEGER")
-_ensure_column("messages", "edited_at", "TIMESTAMP WITH TIME ZONE")
 
+# Ensure receiver_id can be null (room messages use room_id instead)
 with engine.begin() as conn:
     try:
         conn.execute(text("ALTER TABLE messages ALTER COLUMN receiver_id DROP NOT NULL"))
@@ -176,6 +173,11 @@ def get_global_room(db: Session) -> Room:
 # ---------------------------------------------------------------------
 
 def reply_preview_of(db: Session, msg: Message) -> Optional[dict]:
+    """
+    Build the small quoted-message preview attached to any message that
+    replies to another. Returns None if the message isn't a reply or the
+    parent no longer exists.
+    """
     if not msg.reply_to_id:
         return None
     parent = db.query(Message).filter(Message.id == msg.reply_to_id).first()
@@ -258,9 +260,7 @@ def bot_help_text() -> str:
         "• update — how to get the latest version\n"
         "• privacy — what this app stores about you\n"
         "• discover — how to find people to talk to\n"
-        "• room — about the Global Room\n"
-        "• reply — how to reply to a message\n"
-        "• edit — how to edit your own messages\n\n"
+        "• room — about the Global Room\n\n"
         "I can't chat freely — I'm just here to help and share announcements."
     )
 
@@ -297,23 +297,6 @@ def bot_reply(db: Session, user: User, text: str) -> str:
             "Deleted messages are removed from both sides."
         )
 
-    if "edit" in t:
-        return (
-            "To edit a message:\n\n"
-            "• Long-press your own message, tap Edit\n"
-            "• Change the text and tap the ✓ button\n"
-            "• You can only edit within 20 minutes of sending\n\n"
-            "An '(edited)' tag appears next to the time."
-        )
-
-    if "reply" in t or "quote" in t or "swipe" in t:
-        return (
-            "To reply to a message:\n\n"
-            "• Swipe the message bubble to the right\n"
-            "• A reply bar appears above the input — type your reply\n"
-            "• Tap the quoted block on any reply to jump back to the original"
-        )
-
     if "notification" in t or "alert" in t or "sound" in t:
         return (
             "Notifications:\n\n"
@@ -348,6 +331,14 @@ def bot_reply(db: Session, user: User, text: str) -> str:
             "• Tap the search bar to filter by username, bio, or interest\n"
             "• Or tap the ＋ button on the Chats tab to search by exact username\n\n"
             "A good opener: mention something from their bio or a shared interest."
+        )
+
+    if "reply" in t or "quote" in t or "swipe" in t:
+        return (
+            "To reply to a message:\n\n"
+            "• Swipe the message bubble to the right\n"
+            "• A reply bar appears above the input — type your reply\n"
+            "• Tap the quoted block on any reply to jump back to the original"
         )
 
     return (
@@ -460,7 +451,6 @@ class RoomMessageOut(BaseModel):
     content: str
     created_at: str
     reply_to: Optional[dict] = None
-    edited_at: Optional[str] = None
 
 
 class RoomMemberOut(BaseModel):
@@ -491,11 +481,6 @@ class MessageOut(BaseModel):
     created_at: str
     read_at: Optional[str]
     reply_to: Optional[dict] = None
-    edited_at: Optional[str] = None
-
-
-class EditMessageIn(BaseModel):
-    content: str
 
 
 class ReleaseCreate(BaseModel):
@@ -1040,13 +1025,16 @@ def get_global_room_messages(limit: int = 40,
             .limit(limit).all())
     msgs.reverse()
 
-    # Batch lookups (avoid N+1)
+    # --- Batch lookups (avoid N+1 queries) ---
+
+    # 1. All unique sender ids in this page of messages
     sender_ids = {m.sender_id for m in msgs if m.sender_id is not None}
     senders_by_id = {}
     if sender_ids:
         senders = db.query(User).filter(User.id.in_(sender_ids)).all()
         senders_by_id = {u.id: u for u in senders}
 
+    # 2. All unique parent message ids referenced by replies
     parent_ids = {m.reply_to_id for m in msgs if m.reply_to_id is not None}
     parents_by_id = {}
     parent_senders_by_id = {}
@@ -1065,14 +1053,14 @@ def get_global_room_messages(limit: int = 40,
         if not parent:
             return None
         psender = parent_senders_by_id.get(parent.sender_id)
-        t = parent.content or ""
-        if len(t) > 100:
-            t = t[:97] + "..."
+        text = parent.content or ""
+        if len(text) > 100:
+            text = text[:97] + "..."
         return {
             "id": parent.id,
             "sender_id": parent.sender_id,
             "sender_username": psender.username if psender else "unknown",
-            "content": t,
+            "content": text,
         }
 
     out = []
@@ -1087,7 +1075,6 @@ def get_global_room_messages(limit: int = 40,
             "content": m.content,
             "created_at": m.created_at.isoformat(),
             "reply_to": build_reply_preview(m),
-            "edited_at": m.edited_at.isoformat() if m.edited_at else None,
         })
     return out
 
@@ -1134,9 +1121,10 @@ def post_global_room_message(data: SendRoomMessageIn,
         "content": msg.content,
         "created_at": msg.created_at.isoformat(),
         "reply_to": reply_preview_of(db, msg),
-        "edited_at": None,
     }
 
+    # Send to everyone EXCEPT the sender. The sender already drew their
+    # optimistic bubble client-side, so echoing back would duplicate.
     try:
         import asyncio
         asyncio.create_task(manager.broadcast_except(user.id, payload_out))
@@ -1152,7 +1140,6 @@ def post_global_room_message(data: SendRoomMessageIn,
         content=msg.content,
         created_at=msg.created_at.isoformat(),
         reply_to=reply_preview_of(db, msg),
-        edited_at=None,
     )
 
 
@@ -1220,15 +1207,9 @@ def conversations(user: User = Depends(get_current_user),
     unread_rows = db.execute(unread_sql, {"me": user.id}).fetchall()
     unread_by_user = {row[0]: row[1] for row in unread_rows}
 
-    other_ids = {row[0] for row in rows if row[0] is not None}
-    users_by_id = {}
-    if other_ids:
-        us = db.query(User).filter(User.id.in_(other_ids)).all()
-        users_by_id = {u.id: u for u in us}
-
     out = []
     for other_id, content, created_at in rows:
-        u = users_by_id.get(other_id)
+        u = db.query(User).filter(User.id == other_id).first()
         if not u:
             continue
         unread = unread_by_user.get(other_id, 0)
@@ -1310,35 +1291,6 @@ def get_messages(other_user_id: int,
             .order_by(Message.created_at.desc())
             .limit(limit).all())
     msgs.reverse()
-
-    parent_ids = {m.reply_to_id for m in msgs if m.reply_to_id is not None}
-    parents_by_id = {}
-    parent_senders_by_id = {}
-    if parent_ids:
-        parents = db.query(Message).filter(Message.id.in_(parent_ids)).all()
-        parents_by_id = {p.id: p for p in parents}
-        parent_sender_ids = {p.sender_id for p in parents if p.sender_id is not None}
-        if parent_sender_ids:
-            psenders = db.query(User).filter(User.id.in_(parent_sender_ids)).all()
-            parent_senders_by_id = {u.id: u for u in psenders}
-
-    def build_reply_preview(m: Message):
-        if not m.reply_to_id:
-            return None
-        parent = parents_by_id.get(m.reply_to_id)
-        if not parent:
-            return None
-        psender = parent_senders_by_id.get(parent.sender_id)
-        t = parent.content or ""
-        if len(t) > 100:
-            t = t[:97] + "..."
-        return {
-            "id": parent.id,
-            "sender_id": parent.sender_id,
-            "sender_username": psender.username if psender else "unknown",
-            "content": t,
-        }
-
     return [
         {
             "id": m.id,
@@ -1347,8 +1299,7 @@ def get_messages(other_user_id: int,
             "content": m.content,
             "created_at": m.created_at.isoformat(),
             "read_at": m.read_at.isoformat() if m.read_at else None,
-            "reply_to": build_reply_preview(m),
-            "edited_at": m.edited_at.isoformat() if m.edited_at else None,
+            "reply_to": reply_preview_of(db, m),
         }
         for m in msgs
     ]
@@ -1389,7 +1340,6 @@ def post_message(data: SendMessageIn,
         "created_at": msg.created_at.isoformat(),
         "read_at": None,
         "reply_to": reply_preview_of(db, msg),
-        "edited_at": None,
     }
     try:
         import asyncio
@@ -1411,7 +1361,6 @@ def post_message(data: SendMessageIn,
                     "created_at": reply_msg.created_at.isoformat(),
                     "read_at": None,
                     "reply_to": None,
-                    "edited_at": None,
                 }
                 try:
                     import asyncio
@@ -1429,59 +1378,7 @@ def post_message(data: SendMessageIn,
         created_at=msg.created_at.isoformat(),
         read_at=None,
         reply_to=reply_preview_of(db, msg),
-        edited_at=None,
     )
-
-
-@app.put("/messages/{message_id}")
-def edit_message(message_id: int,
-                 data: EditMessageIn,
-                 user: User = Depends(get_current_user),
-                 db: Session = Depends(get_db)):
-    m = db.query(Message).filter(Message.id == message_id).first()
-    if not m:
-        raise HTTPException(status_code=404, detail="Message not found")
-    if m.sender_id != user.id:
-        raise HTTPException(status_code=403, detail="You can only edit your own messages")
-
-    created = m.created_at.replace(tzinfo=None) if m.created_at else datetime.utcnow()
-    if (datetime.utcnow() - created).total_seconds() > EDIT_WINDOW_SECONDS:
-        raise HTTPException(status_code=403, detail="You can only edit within 20 minutes")
-
-    new_content = (data.content or "").strip()
-    if not new_content:
-        raise HTTPException(status_code=400, detail="Empty message")
-    if new_content != m.content:
-        m.content = new_content
-        m.edited_at = datetime.utcnow()
-        db.commit()
-        db.refresh(m)
-
-    payload_out = {
-        "type": "message_edited",
-        "id": m.id,
-        "content": m.content,
-        "edited_at": m.edited_at.isoformat() if m.edited_at else None,
-        "room_id": m.room_id,
-        "from": m.sender_id,
-        "to": m.receiver_id,
-    }
-
-    try:
-        import asyncio
-        if m.room_id is not None:
-            asyncio.create_task(manager.broadcast(payload_out))
-        else:
-            asyncio.create_task(manager.send_to(m.receiver_id, payload_out))
-            asyncio.create_task(manager.send_to(m.sender_id, payload_out))
-    except Exception:
-        pass
-
-    return {
-        "id": m.id,
-        "content": m.content,
-        "edited_at": m.edited_at.isoformat() if m.edited_at else None,
-    }
 
 
 @app.delete("/messages/{message_id}")
@@ -1655,7 +1552,6 @@ def admin_broadcast(data: BroadcastIn,
                         "created_at": msg.created_at.isoformat(),
                         "read_at": None,
                         "reply_to": None,
-                        "edited_at": None,
                     }
                     asyncio.create_task(manager.send_to(u.id, payload))
                 except Exception:
@@ -2089,6 +1985,11 @@ def admin_panel():
 # ---------------------------------------------------------------------
 
 class ConnectionManager:
+    """
+    Holds WebSocket connections per user. Multiple sockets per user
+    are all delivered to. A disconnect removes only the specific
+    socket that dropped.
+    """
     def __init__(self):
         self.active: dict[int, set[WebSocket]] = {}
 
@@ -2118,10 +2019,12 @@ class ConnectionManager:
             self.disconnect(user_id, ws)
 
     async def broadcast(self, message: dict):
+        """Send to every connected socket, across all users."""
         for uid in list(self.active.keys()):
             await self.send_to(uid, message)
 
     async def broadcast_except(self, exclude_user_id: int, message: dict):
+        """Send to every connected socket except one user's sockets."""
         for uid in list(self.active.keys()):
             if uid == exclude_user_id:
                 continue
@@ -2177,6 +2080,7 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
                     pass
                 continue
 
+            # Room message via WebSocket
             if msg_type == "room_message":
                 content = (data.get("content") or "").strip()
                 if not content:
@@ -2226,11 +2130,12 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
                     "content": content,
                     "created_at": msg.created_at.isoformat(),
                     "reply_to": reply_preview_of(db, msg),
-                    "edited_at": None,
                 }
+                # Don't echo back to the sender's own socket.
                 await manager.broadcast_except(user_id, payload_out)
                 continue
 
+            # Regular DM
             receiver_id = data.get("to")
             content = (data.get("content") or "").strip()
 
@@ -2271,7 +2176,6 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
                 "created_at": msg.created_at.isoformat(),
                 "read_at": None,
                 "reply_to": reply_preview_of(db, msg),
-                "edited_at": None,
             }
 
             await manager.send_to(user_id, payload_out)
@@ -2291,7 +2195,6 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
                             "created_at": reply_msg.created_at.isoformat(),
                             "read_at": None,
                             "reply_to": None,
-                            "edited_at": None,
                         }
                         await manager.send_to(user_id, reply_payload)
                 except Exception:
@@ -2312,3 +2215,7 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
 @app.get("/health")
 def health():
     return {"status": "ok"}
+    
+    # --- Phase A features ---
+from features import register_features
+register_features(app)
