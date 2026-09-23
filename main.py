@@ -8,6 +8,7 @@ Includes:
 - WhatsApp-style swipe-to-reply (reply_to_id + reply preview)
 - Edit within 20 minutes + "edited" tag
 - Media messages (image / file / voice) — endpoints + WS transport
+- Message reactions (add / remove / list)
 - Global Room — one room everyone is in, with unread counts and members list
 - Release / update system + admin panel + broadcast
 - Bot account ("thegoodboy")
@@ -499,6 +500,7 @@ class RoomMessageOut(BaseModel):
     media_width: Optional[int] = None
     media_height: Optional[int] = None
     media_duration: Optional[int] = None
+    reactions: List[dict] = []
 
 
 class RoomMemberOut(BaseModel):
@@ -554,6 +556,7 @@ class MessageOut(BaseModel):
     media_width: Optional[int] = None
     media_height: Optional[int] = None
     media_duration: Optional[int] = None
+    reactions: List[dict] = []
 
 
 class EditMessageIn(BaseModel):
@@ -779,18 +782,6 @@ def _media_fields_for_message(msg: Message) -> dict:
             "media_height": getattr(msg, "media_height", None),
             "media_duration": getattr(msg, "media_duration", None),
         }
-        
-        def _reaction_fields_for_message(msg: Message, db: Session, me_id: int) -> dict:
-    """
-    Return {"reactions": [...]} for a message. The array is grouped by
-    emoji: [{"emoji": "❤️", "count": 3, "mine": true}, ...].
-    Delegates to features.py; returns [] if features isn't available.
-    """
-    try:
-        from features import reactions_for_message
-        return {"reactions": reactions_for_message(db, msg.id, me_id)}
-    except Exception:
-        return {"reactions": []}
 
     media_url = None
     thumb_url = None
@@ -811,6 +802,19 @@ def _media_fields_for_message(msg: Message) -> dict:
         "media_height": msg.media_height,
         "media_duration": msg.media_duration,
     }
+
+
+def _reaction_fields_for_message(msg: Message, db: Session, me_id: int) -> dict:
+    """
+    Return {"reactions": [...]} for a message. The array is grouped by
+    emoji: [{"emoji": "❤️", "count": 3, "mine": true}, ...].
+    Delegates to features.py; returns [] if features isn't available.
+    """
+    try:
+        from features import reactions_for_message
+        return {"reactions": reactions_for_message(db, msg.id, me_id)}
+    except Exception:
+        return {"reactions": []}
 
 
 # ---------------------------------------------------------------------
@@ -1274,10 +1278,9 @@ def post_global_room_message(data: SendRoomMessageIn,
 
     media_fields = _media_fields_for_message(msg)
 
-    # ---- WS payload (dual-keyed for old + new clients) ----
     payload_out = {
-        "type": "room_message",       # event discriminator (legacy key)
-        "event": "room_message",      # event discriminator (new key)
+        "type": "room_message",
+        "event": "room_message",
         "media_kind": media_fields["type"],
         "room_id": room.id,
         "id": msg.id,
@@ -1289,6 +1292,7 @@ def post_global_room_message(data: SendRoomMessageIn,
         "created_at": msg.created_at.isoformat(),
         "reply_to": reply_preview_of(db, msg),
         "edited_at": None,
+        "reactions": [],
     }
     payload_out.update(media_fields)
 
@@ -1308,6 +1312,7 @@ def post_global_room_message(data: SendRoomMessageIn,
         "created_at": msg.created_at.isoformat(),
         "reply_to": reply_preview_of(db, msg),
         "edited_at": None,
+        "reactions": [],
     }
     resp.update(media_fields)
     return resp
@@ -1422,8 +1427,8 @@ def mark_conversation_read(other_user_id: int,
     try:
         import asyncio
         asyncio.create_task(manager.send_to(other_user_id, {
-            "type": "read",         # legacy
-            "event": "read",        # new
+            "type": "read",
+            "event": "read",
             "by": user.id,
         }))
     except Exception:
@@ -1577,6 +1582,7 @@ def post_message(data: SendMessageIn,
         "reply_to": reply_preview_of(db, msg),
         "edited_at": None,
         "media_kind": media_fields["type"],
+        "reactions": [],
     }
     payload_out.update(media_fields)
 
@@ -1610,6 +1616,7 @@ def post_message(data: SendMessageIn,
                     "media_width": None,
                     "media_height": None,
                     "media_duration": None,
+                    "reactions": [],
                 }
                 try:
                     import asyncio
@@ -1628,6 +1635,7 @@ def post_message(data: SendMessageIn,
         "read_at": None,
         "reply_to": reply_preview_of(db, msg),
         "edited_at": None,
+        "reactions": [],
     }
     resp.update(media_fields)
     return resp
@@ -1658,8 +1666,8 @@ def edit_message(message_id: int,
         db.refresh(m)
 
     payload_out = {
-        "type": "message_edited",     # legacy
-        "event": "message_edited",    # new
+        "type": "message_edited",
+        "event": "message_edited",
         "id": m.id,
         "content": m.content,
         "edited_at": m.edited_at.isoformat() if m.edited_at else None,
@@ -1811,8 +1819,8 @@ def admin_rename_room(data: RenameRoomIn,
     try:
         import asyncio
         asyncio.create_task(manager.broadcast({
-            "type": "room_renamed",     # legacy
-            "event": "room_renamed",    # new
+            "type": "room_renamed",
+            "event": "room_renamed",
             "room_id": room.id,
             "name": room.name,
         }))
@@ -1867,6 +1875,7 @@ def admin_broadcast(data: BroadcastIn,
                         "media_width": None,
                         "media_height": None,
                         "media_duration": None,
+                        "reactions": [],
                     }
                     asyncio.create_task(manager.send_to(u.id, payload))
                 except Exception:
@@ -2387,8 +2396,8 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
                     continue
                 try:
                     await manager.send_to(int(target), {
-                        "type": msg_type,       # legacy
-                        "event": msg_type,      # new
+                        "type": msg_type,
+                        "event": msg_type,
                         "from": user_id,
                         "from_username": username,
                     })
@@ -2476,6 +2485,7 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
                     "created_at": msg.created_at.isoformat(),
                     "reply_to": reply_preview_of(db, msg),
                     "edited_at": None,
+                    "reactions": [],
                 }
                 payload_out.update(media_fields)
                 await manager.broadcast_except(user_id, payload_out)
@@ -2525,6 +2535,7 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
                 "reply_to": reply_preview_of(db, msg),
                 "edited_at": None,
                 "media_kind": media_fields["type"],
+                "reactions": [],
             }
             payload_out.update(media_fields)
 
@@ -2555,6 +2566,7 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
                             "media_width": None,
                             "media_height": None,
                             "media_duration": None,
+                            "reactions": [],
                         }
                         await manager.send_to(user_id, reply_payload)
                 except Exception:
