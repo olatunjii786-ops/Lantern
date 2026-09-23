@@ -7,3 +7,5 @@ bcrypt
 python-jose[cryptography]
 pydantic[email]
 python-multipart
+pillow
+b2sdk
