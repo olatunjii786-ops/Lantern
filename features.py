@@ -1076,9 +1076,6 @@ def register_features(app):
     app.include_router(reactions_router)
     app.include_router(presence_router)
     
-    @app.post("/debug/run-daily-quote")
-def _debug_run_daily_quote():
-    return {"ok": post_daily_quote_once()}
 
     @app.on_event("startup")
     def _features_startup():
