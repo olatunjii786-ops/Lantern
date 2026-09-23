@@ -880,6 +880,12 @@ def register(data: UserCreate, db: Session = Depends(get_db)):
     except Exception:
         pass
 
+    try:
+        from features import post_welcome_in_room
+        post_welcome_in_room(user.id, user.username)
+    except Exception as e:
+        print(f"[register] post_welcome_in_room error: {e!r}")
+
     return Token(access_token=create_access_token(user.id, user.username))
 
 
@@ -2372,6 +2378,12 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
 
     await manager.connect(user_id, websocket)
 
+    try:
+        from features import presence_on_connect
+        presence_on_connect(user_id)
+    except Exception as e:
+        print(f"[ws] presence_on_connect error: {e!r}")
+
     db = SessionLocal()
     try:
         u = db.query(User).filter(User.id == user_id).first()
@@ -2574,8 +2586,18 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
 
     except WebSocketDisconnect:
         manager.disconnect(user_id, websocket)
+        try:
+            from features import presence_on_disconnect
+            presence_on_disconnect(user_id)
+        except Exception as e:
+            print(f"[ws] presence_on_disconnect error: {e!r}")
     except Exception:
         manager.disconnect(user_id, websocket)
+        try:
+            from features import presence_on_disconnect
+            presence_on_disconnect(user_id)
+        except Exception as e:
+            print(f"[ws] presence_on_disconnect error: {e!r}")
     finally:
         db.close()
 

@@ -5,23 +5,30 @@ Attaches itself to the app defined in main.py. Exposes:
 - register_features(app)          called once at the bottom of main.py
 - handle_feature_ws(...)          called from the WS loop in main.py
 - reactions_for_message(...)      called by main.py's serializers
-- decorate_message_dict(...)      (media) called by main.py
 
 Contents (Phase A):
 - Backblaze B2 client via the S3-compatible API (boto3)
 - /media/upload + /media/sign endpoints
 - Media messages (image / file / voice)
 - Message reactions (add / remove / list)
+- Presence in the Global Room (WS broadcast + REST list)
+- Daily quote bot post (ZenQuotes + Lantern-themed drawn card)
+- Welcome-in-room announcement on register
 """
 
 import io
 import os
 import uuid
+import asyncio
+import random
+import urllib.request
+import urllib.error
+from datetime import datetime, timedelta, timezone
 from typing import Optional, List
 
 from fastapi import APIRouter, File, UploadFile, HTTPException, Form, Depends
 from pydantic import BaseModel
-from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, UniqueConstraint, func, and_
+from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, UniqueConstraint, func
 from sqlalchemy.orm import Session
 
 # These imports reach into main.py. They only work because
@@ -32,9 +39,14 @@ from main import (
     engine,
     User,
     Message,
+    Room,
     manager,
     get_current_user,
     get_db,
+    get_global_room,
+    get_bot,
+    display_name_of,
+    signed_url_for_key as _unused,  # not used; keep import shape stable
 )
 
 # ---------------------------------------------------------------------
@@ -62,8 +74,10 @@ IMAGE_TARGET_MAX_DIM = 1600
 IMAGE_JPEG_QUALITY = 82
 THUMB_TARGET_MAX_DIM = 240
 
-# Reactions whitelist. Must match what the client offers.
 ALLOWED_REACTIONS = ["❤️", "😂", "😮", "😢", "👍", "🔥", "🎉"]
+
+DAILY_QUOTE_HOUR_UTC = int(os.environ.get("DAILY_QUOTE_HOUR_UTC", "6"))
+DAILY_QUOTE_MINUTE_UTC = int(os.environ.get("DAILY_QUOTE_MINUTE_UTC", "0"))
 
 
 # ---------------------------------------------------------------------
@@ -187,7 +201,6 @@ class MessageReaction(Base):
     )
 
 
-# Create the table immediately (safe if it already exists).
 try:
     MessageReaction.__table__.create(bind=engine, checkfirst=True)
 except Exception as e:
@@ -195,11 +208,6 @@ except Exception as e:
 
 
 def reactions_for_message(db: Session, message_id: int, me_id: int) -> list:
-    """
-    Group reactions for a message into:
-      [{"emoji": "❤️", "count": 3, "mine": true}, ...]
-    `mine` is True if the current user has reacted with this emoji.
-    """
     try:
         rows = (db.query(MessageReaction)
                 .filter(MessageReaction.message_id == message_id)
@@ -217,7 +225,6 @@ def reactions_for_message(db: Session, message_id: int, me_id: int) -> list:
         if r.user_id == me_id:
             g["mine"] = True
 
-    # Order by the whitelist order so all clients render consistently.
     order = {e: i for i, e in enumerate(ALLOWED_REACTIONS)}
     return sorted(grouped.values(), key=lambda x: order.get(x["emoji"], 99))
 
@@ -386,7 +393,6 @@ def react_to_message(message_id: int,
     if not m:
         raise HTTPException(status_code=404, detail="Message not found")
 
-    # Can't react to a message that belongs to a DM you're not part of.
     if m.room_id is None and m.receiver_id is not None:
         if user.id not in (m.sender_id, m.receiver_id):
             raise HTTPException(status_code=403, detail="Not your conversation")
@@ -405,9 +411,9 @@ def react_to_message(message_id: int,
         db.add(MessageReaction(message_id=message_id, user_id=user.id, emoji=emoji))
     db.commit()
 
-    # Group after the change so we can broadcast the fresh count.
     grouped = reactions_for_message(db, message_id, user.id)
-    this = next((g for g in grouped if g["emoji"] == emoji), {"emoji": emoji, "count": 0, "mine": False})
+    this = next((g for g in grouped if g["emoji"] == emoji),
+                {"emoji": emoji, "count": 0, "mine": False})
 
     payload = {
         "type": "reaction_changed",
@@ -421,7 +427,6 @@ def react_to_message(message_id: int,
     }
 
     try:
-        import asyncio
         if m.room_id is not None:
             asyncio.create_task(manager.broadcast(payload))
         else:
@@ -454,14 +459,504 @@ def get_reactions(message_id: int,
 
 
 # ---------------------------------------------------------------------
+# Presence — in-memory, driven by WS connections
+# ---------------------------------------------------------------------
+
+def online_user_ids() -> list:
+    """
+    Return the list of user ids that currently have at least one live WS
+    socket. This is the true "online right now" set.
+    """
+    try:
+        return [uid for uid, socks in manager.active.items() if socks]
+    except Exception:
+        return []
+
+
+presence_router = APIRouter(tags=["presence"])
+
+
+@presence_router.get("/rooms/global/presence")
+def room_presence(user: User = Depends(get_current_user),
+                  db: Session = Depends(get_db)):
+    """
+    Return the currently-online users in the room, with avatars.
+    The client renders these as a small horizontal row of bubbles.
+    """
+    ids = online_user_ids()
+    if not ids:
+        return {"online": [], "count": 0}
+
+    users = (db.query(User)
+             .filter(User.id.in_(ids))
+             .filter(User.is_bot == False)
+             .filter(User.deleted_at == None)
+             .all())
+
+    # Exclude the caller from the roster — they know they're online.
+    out = []
+    for u in users:
+        out.append({
+            "id": u.id,
+            "username": u.username,
+            "avatar": u.avatar,
+        })
+
+    return {"online": out, "count": len(out)}
+
+
+async def _broadcast_presence(db: Session):
+    """Push the current online roster to every connected socket."""
+    ids = online_user_ids()
+    users = []
+    if ids:
+        try:
+            rows = (db.query(User)
+                    .filter(User.id.in_(ids))
+                    .filter(User.is_bot == False)
+                    .filter(User.deleted_at == None)
+                    .all())
+            users = [{"id": u.id, "username": u.username, "avatar": u.avatar}
+                     for u in rows]
+        except Exception:
+            users = []
+    payload = {
+        "type": "presence_changed",
+        "event": "presence_changed",
+        "online": users,
+        "count": len(users),
+    }
+    try:
+        await manager.broadcast(payload)
+    except Exception:
+        pass
+
+
+def presence_on_connect(user_id: int):
+    """Called from main.py after a WS connects. Fire-and-forget broadcast."""
+    db = SessionLocal()
+    try:
+        asyncio.create_task(_broadcast_presence(db))
+    except Exception as e:
+        print(f"[features] presence_on_connect failed: {e!r}")
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
+
+
+def presence_on_disconnect(user_id: int):
+    """Called from main.py after a WS disconnects."""
+    db = SessionLocal()
+    try:
+        asyncio.create_task(_broadcast_presence(db))
+    except Exception as e:
+        print(f"[features] presence_on_disconnect failed: {e!r}")
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------
+# Daily quote — fetch, draw, upload, post
+# ---------------------------------------------------------------------
+
+ZENQUOTES_URL = "https://zenquotes.io/api/today"
+QUOTE_USER_AGENT = "Lantern/1.0 (+https://lantern-dhhb.onrender.com)"
+
+
+def _fetch_today_quote() -> Optional[dict]:
+    """
+    Fetch today's quote from ZenQuotes. Returns {"q": "...", "a": "..."}
+    or None on failure.
+    """
+    try:
+        req = urllib.request.Request(ZENQUOTES_URL)
+        req.add_header("User-Agent", QUOTE_USER_AGENT)
+        req.add_header("Accept", "application/json")
+        with urllib.request.urlopen(req, timeout=15) as r:
+            data = r.read().decode("utf-8")
+        import json as _json
+        arr = _json.loads(data)
+        if not isinstance(arr, list) or not arr:
+            return None
+        first = arr[0]
+        q = (first.get("q") or "").strip()
+        a = (first.get("a") or "").strip() or "Unknown"
+        if not q:
+            return None
+        return {"q": q, "a": a}
+    except Exception as e:
+        print(f"[features] quote fetch failed: {e!r}")
+        return None
+
+
+def _palette_for_weekday(weekday: int):
+    """
+    weekday: 0 = Monday, 6 = Sunday.
+    Returns (top_rgb, bottom_rgb, glow_rgb).
+    """
+    palettes = {
+        0: ((20, 30, 70), (10, 15, 40), (90, 130, 220)),   # Mon - cool blue
+        1: ((20, 60, 50), (10, 35, 30), (90, 200, 160)),   # Tue - soft green
+        2: ((45, 35, 75), (25, 20, 45), (160, 130, 220)),  # Wed - lavender
+        3: ((80, 55, 25), (45, 30, 15), (220, 160, 80)),   # Thu - ochre
+        4: ((110, 45, 25), (60, 25, 15), (255, 120, 70)),  # Fri - orange
+        5: ((95, 60, 80), (55, 35, 50), (240, 160, 200)),  # Sat - pastel pink
+        6: ((90, 40, 60), (50, 25, 35), (230, 130, 160)),  # Sun - rose
+    }
+    return palettes.get(weekday, palettes[4])
+
+
+def _draw_quote_card(quote_text: str, author: str, weekday: int) -> bytes:
+    """
+    Render a Lantern-themed quote card and return JPEG bytes.
+    Falls back to None on error (caller should handle).
+    """
+    from PIL import Image, ImageDraw, ImageFont
+
+    W, H = 1080, 1350
+    top_rgb, bot_rgb, glow_rgb = _palette_for_weekday(weekday)
+
+    img = Image.new("RGB", (W, H), top_rgb)
+    draw = ImageDraw.Draw(img)
+
+    # Vertical gradient
+    for y in range(H):
+        t = y / float(H - 1)
+        r = int(top_rgb[0] * (1 - t) + bot_rgb[0] * t)
+        g = int(top_rgb[1] * (1 - t) + bot_rgb[1] * t)
+        b = int(top_rgb[2] * (1 - t) + bot_rgb[2] * t)
+        draw.line([(0, y), (W, y)], fill=(r, g, b))
+
+    # Soft radial glow near top
+    glow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    gdraw = ImageDraw.Draw(glow)
+    cx, cy, radius = int(W * 0.5), int(H * 0.22), int(W * 0.55)
+    steps = 60
+    for i in range(steps, 0, -1):
+        r = int(radius * i / steps)
+        alpha = int(70 * (1 - i / steps))
+        gdraw.ellipse(
+            [cx - r, cy - r, cx + r, cy + r],
+            fill=(glow_rgb[0], glow_rgb[1], glow_rgb[2], alpha),
+        )
+    img = Image.alpha_composite(img.convert("RGBA"), glow).convert("RGB")
+    draw = ImageDraw.Draw(img)
+
+    # Fonts — try a few common ones, fall back to default.
+    def load_font(size: int, bold: bool = False):
+        candidates = [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSerif-Bold.ttf" if bold else "/usr/share/fonts/truetype/liberation/LiberationSerif-Regular.ttf",
+        ]
+        for path in candidates:
+            try:
+                return ImageFont.truetype(path, size)
+            except Exception:
+                continue
+        return ImageFont.load_default()
+
+    def wrap_text(text: str, font, max_width: int):
+        words = text.split()
+        lines = []
+        current = ""
+        tmp_draw = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+        for word in words:
+            test = (current + " " + word).strip()
+            try:
+                w = tmp_draw.textlength(test, font=font)
+            except Exception:
+                w = len(test) * (font.size if hasattr(font, "size") else 20)
+            if w <= max_width:
+                current = test
+            else:
+                if current:
+                    lines.append(current)
+                current = word
+        if current:
+            lines.append(current)
+        return lines
+
+    # Quote body
+    quote_font = load_font(72, bold=False)
+    author_font = load_font(40, bold=False)
+    header_font = load_font(34, bold=True)
+
+    header_text = "🌅  Good morning, Lantern"
+    try:
+        hw = draw.textlength(header_text, font=header_font)
+    except Exception:
+        hw = len(header_text) * 20
+    draw.text(((W - hw) / 2, int(H * 0.08)), header_text,
+              font=header_font, fill=(255, 255, 255))
+
+    max_text_w = int(W * 0.78)
+    lines = wrap_text(quote_text, quote_font, max_text_w)
+
+    line_h = 96
+    total_h = len(lines) * line_h
+    y = (H - total_h) // 2
+    for line in lines:
+        try:
+            lw = draw.textlength(line, font=quote_font)
+        except Exception:
+            lw = len(line) * 36
+        # subtle drop shadow
+        draw.text(((W - lw) / 2 + 2, y + 2), line,
+                  font=quote_font, fill=(0, 0, 0))
+        draw.text(((W - lw) / 2, y), line,
+                  font=quote_font, fill=(255, 255, 255))
+        y += line_h
+
+    # Author
+    author_line = f"— {author}"
+    try:
+        aw = draw.textlength(author_line, font=author_font)
+    except Exception:
+        aw = len(author_line) * 20
+    draw.text(((W - aw) / 2, y + 40), author_line,
+              font=author_font, fill=(230, 230, 240))
+
+    # Lantern watermark, bottom right — a small glowing circle
+    wx, wy, wr = int(W * 0.88), int(H * 0.92), 42
+    wm = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    wmd = ImageDraw.Draw(wm)
+    for i in range(20, 0, -1):
+        rr = int(wr * i / 20)
+        alpha = int(120 * (1 - i / 20))
+        wmd.ellipse([wx - rr, wy - rr, wx + rr, wy + rr],
+                    fill=(255, 210, 150, alpha))
+    wmd.ellipse([wx - wr // 2, wy - wr // 2, wx + wr // 2, wy + wr // 2],
+                fill=(255, 160, 90, 220))
+    img = Image.alpha_composite(img.convert("RGBA"), wm).convert("RGB")
+    draw = ImageDraw.Draw(img)
+
+    # Attribution
+    attr = "Powered by ZenQuotes"
+    attr_font = load_font(22, bold=False)
+    try:
+        atw = draw.textlength(attr, font=attr_font)
+    except Exception:
+        atw = len(attr) * 12
+    draw.text(((W - atw) / 2, H - 60), attr,
+              font=attr_font, fill=(200, 200, 215))
+
+    out = io.BytesIO()
+    img.save(out, format="JPEG", quality=88, optimize=True)
+    return out.getvalue()
+
+
+def post_daily_quote_once() -> bool:
+    """
+    Fetch today's quote, draw the card, upload to B2, post as a media
+    message in the Global Room from the bot. Returns True on success.
+    """
+    db = SessionLocal()
+    try:
+        bot = get_bot(db)
+        if not bot:
+            print("[features] daily quote: bot missing")
+            return False
+
+        quote = _fetch_today_quote()
+        if not quote:
+            print("[features] daily quote: fetch failed")
+            return False
+
+        text = quote["q"]
+        author = quote["a"]
+
+        weekday = datetime.utcnow().weekday()
+        try:
+            card_bytes = _draw_quote_card(text, author, weekday)
+        except Exception as e:
+            print(f"[features] daily quote: draw failed: {e!r}")
+            return False
+
+        key = f"daily/{datetime.utcnow().strftime('%Y-%m-%d')}-{uuid.uuid4().hex[:8]}.jpg"
+        try:
+            upload_bytes(card_bytes, key, "image/jpeg")
+        except Exception as e:
+            print(f"[features] daily quote: upload failed: {e!r}")
+            return False
+
+        thumb_key = f"daily/thumbs/{uuid.uuid4().hex[:8]}.jpg"
+        try:
+            upload_bytes(card_bytes[:200_000], thumb_key, "image/jpeg")
+        except Exception:
+            thumb_key = None
+
+        room = get_global_room(db)
+        caption = f"🌅 Good morning, Lantern.\n\n\"{text}\"\n— {author}"
+
+        msg = Message(
+            sender_id=bot.id,
+            room_id=room.id,
+            content=caption,
+            type="image",
+            media_key=key,
+            media_thumb_key=thumb_key,
+            media_name="daily-quote.jpg",
+            media_size=len(card_bytes),
+            media_width=1080,
+            media_height=1350,
+        )
+        db.add(msg)
+        db.commit()
+        db.refresh(msg)
+
+        payload = {
+            "type": "room_message",
+            "event": "room_message",
+            "media_kind": "image",
+            "room_id": room.id,
+            "id": msg.id,
+            "sender_id": bot.id,
+            "sender_username": bot.username,
+            "sender_display_name": "Lantern Good Boy",
+            "sender_avatar": bot.avatar,
+            "content": caption,
+            "created_at": msg.created_at.isoformat(),
+            "reply_to": None,
+            "edited_at": None,
+            "reactions": [],
+            "media_url": signed_url_for_key(key),
+            "thumb_url": signed_url_for_key(thumb_key),
+            "media_name": "daily-quote.jpg",
+            "media_size": len(card_bytes),
+            "media_width": 1080,
+            "media_height": 1350,
+            "media_duration": None,
+        }
+
+        try:
+            asyncio.create_task(manager.broadcast(payload))
+        except Exception:
+            pass
+
+        print(f"[features] daily quote posted: {msg.id}")
+        return True
+    except Exception as e:
+        print(f"[features] post_daily_quote_once failed: {e!r}")
+        return False
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
+
+
+async def _daily_quote_loop():
+    """Wait until the next scheduled time, post the quote, repeat."""
+    while True:
+        now = datetime.now(timezone.utc)
+        target = now.replace(
+            hour=DAILY_QUOTE_HOUR_UTC,
+            minute=DAILY_QUOTE_MINUTE_UTC,
+            second=0,
+            microsecond=0,
+        )
+        if target <= now:
+            target = target + timedelta(days=1)
+        wait_seconds = (target - now).total_seconds()
+        print(f"[features] daily quote scheduled in {int(wait_seconds)}s "
+              f"(at {target.isoformat()})")
+        try:
+            await asyncio.sleep(wait_seconds)
+        except asyncio.CancelledError:
+            return
+        try:
+            post_daily_quote_once()
+        except Exception as e:
+            print(f"[features] daily quote loop error: {e!r}")
+        # brief cooldown so we don't double-post if the clock jumps
+        await asyncio.sleep(60)
+
+
+def post_welcome_in_room(new_user_id: int, new_username: str):
+    """
+    Called from main.py after a successful register, so the bot posts
+    a welcome message in the Global Room.
+    """
+    db = SessionLocal()
+    try:
+        bot = get_bot(db)
+        if not bot:
+            return
+        room = get_global_room(db)
+        text = f"👋 **{new_username}** just joined Lantern. Say hi!"
+        msg = Message(
+            sender_id=bot.id,
+            room_id=room.id,
+            content=text,
+            type="text",
+        )
+        db.add(msg)
+        db.commit()
+        db.refresh(msg)
+
+        payload = {
+            "type": "room_message",
+            "event": "room_message",
+            "media_kind": "text",
+            "room_id": room.id,
+            "id": msg.id,
+            "sender_id": bot.id,
+            "sender_username": bot.username,
+            "sender_display_name": "Lantern Good Boy",
+            "sender_avatar": bot.avatar,
+            "content": text,
+            "created_at": msg.created_at.isoformat(),
+            "reply_to": None,
+            "edited_at": None,
+            "reactions": [],
+            "media_url": None,
+            "thumb_url": None,
+            "media_name": None,
+            "media_size": None,
+            "media_width": None,
+            "media_height": None,
+            "media_duration": None,
+        }
+        try:
+            asyncio.create_task(manager.broadcast(payload))
+        except Exception:
+            pass
+    except Exception as e:
+        print(f"[features] post_welcome_in_room failed: {e!r}")
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------
+# Debug/admin: manual trigger of the daily quote
+# ---------------------------------------------------------------------
+
+debug_router = APIRouter(tags=["debug"])
+
+
+@debug_router.post("/debug/run-daily-quote")
+def debug_run_daily_quote(user: User = Depends(get_current_user)):
+    """Manually trigger the daily quote post. Useful for testing."""
+    if user.is_bot:
+        raise HTTPException(status_code=403, detail="Bots can't trigger this")
+    success = post_daily_quote_once()
+    return {"ok": success}
+
+
+# ---------------------------------------------------------------------
 # Message serialization helpers (called from main.py)
 # ---------------------------------------------------------------------
 
 def decorate_message_dict(msg: Message, d: dict) -> dict:
-    """
-    Attach media fields (kind, signed URLs, metadata) to a message dict.
-    Text messages get nulls.
-    """
     mtype = (getattr(msg, "type", None) or "text")
     d["type"] = mtype
 
@@ -493,11 +988,7 @@ def handle_feature_ws(user_id: int, username: str, db: Session,
                       msg_type: str, data: dict) -> bool:
     """
     Called from the WS loop in main.py for every incoming WS message.
-    Return True if we handled it.
-
-    Reactions travel over REST (POST /messages/{id}/react), not WS —
-    so there's nothing to handle on the WS receive side here yet.
-    Future: presence, group_message, etc.
+    Return True if we handled it. Currently no new WS inbound events.
     """
     return False
 
@@ -510,6 +1001,8 @@ def register_features(app):
     """Called at the very bottom of main.py."""
     app.include_router(media_router)
     app.include_router(reactions_router)
+    app.include_router(presence_router)
+    app.include_router(debug_router)
 
     @app.on_event("startup")
     def _features_startup():
@@ -523,3 +1016,16 @@ def register_features(app):
             print("[features] message_reactions table ready")
         except Exception as e:
             print(f"[features] message_reactions table create failed: {e!r}")
+
+        # Start the daily-quote scheduler. We capture the running loop here
+        # because main.py runs inside uvicorn's event loop.
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                loop.create_task(_daily_quote_loop())
+                print("[features] daily quote scheduler started")
+            else:
+                asyncio.create_task(_daily_quote_loop())
+                print("[features] daily quote scheduler created (loop not yet running)")
+        except Exception as e:
+            print(f"[features] could not start daily quote scheduler: {e!r}")
