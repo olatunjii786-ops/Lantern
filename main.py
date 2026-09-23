@@ -779,6 +779,18 @@ def _media_fields_for_message(msg: Message) -> dict:
             "media_height": getattr(msg, "media_height", None),
             "media_duration": getattr(msg, "media_duration", None),
         }
+        
+        def _reaction_fields_for_message(msg: Message, db: Session, me_id: int) -> dict:
+    """
+    Return {"reactions": [...]} for a message. The array is grouped by
+    emoji: [{"emoji": "❤️", "count": 3, "mine": true}, ...].
+    Delegates to features.py; returns [] if features isn't available.
+    """
+    try:
+        from features import reactions_for_message
+        return {"reactions": reactions_for_message(db, msg.id, me_id)}
+    except Exception:
+        return {"reactions": []}
 
     media_url = None
     thumb_url = None
@@ -1203,6 +1215,7 @@ def get_global_room_messages(limit: int = 40,
             "edited_at": m.edited_at.isoformat() if m.edited_at else None,
         }
         d.update(_media_fields_for_message(m))
+        d.update(_reaction_fields_for_message(m, db, user.id))
         out.append(d)
     return out
 
@@ -1498,6 +1511,7 @@ def get_messages(other_user_id: int,
             "edited_at": m.edited_at.isoformat() if m.edited_at else None,
         }
         d.update(_media_fields_for_message(m))
+        d.update(_reaction_fields_for_message(m, db, user.id))
         out.append(d)
     return out
 
