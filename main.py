@@ -1144,14 +1144,18 @@ def get_global_room_info(user: User = Depends(get_current_user),
             sender_label = "You" if sender.id == user.id else display_name_of(sender)
             text = last.content or ""
             if not text:
-                if (last.type or "text") == "image":
+                kind = (last.type or "text").lower()
+                if kind == "image":
                     text = "📷 Photo"
-                elif (last.type or "text") == "video":
+                elif kind == "video":
                     text = "🎬 Video"
-                elif (last.type or "text") == "voice":
+                elif kind == "voice":
                     text = "🎤 Voice message"
-                elif (last.type or "text") == "file":
-                    text = "📎 File"
+                elif kind == "file":
+                    if last.media_name:
+                        text = f"📎 {last.media_name}"
+                    else:
+                        text = "📎 File"
             if len(text) > 80:
                 text = text[:77] + "..."
             preview = f"{sender_label}: {text}"
@@ -1363,7 +1367,9 @@ def conversations(user: User = Depends(get_current_user),
         SELECT
             CASE WHEN sender_id = :me THEN receiver_id ELSE sender_id END AS other_id,
             content,
-            created_at
+            created_at,
+            type,
+            media_name
         FROM (
             SELECT *,
                    ROW_NUMBER() OVER (
@@ -1395,12 +1401,29 @@ def conversations(user: User = Depends(get_current_user),
         users_by_id = {u.id: u for u in us}
 
     out = []
-    for other_id, content, created_at in rows:
+    for other_id, content, created_at, mtype, media_name in rows:
         u = users_by_id.get(other_id)
         if not u:
             continue
         unread = unread_by_user.get(other_id, 0)
-        preview = content or ""
+
+        text_preview = content or ""
+        if not text_preview:
+            kind = (mtype or "text").lower()
+            if kind == "image":
+                text_preview = "📷 Photo"
+            elif kind == "video":
+                text_preview = "🎬 Video"
+            elif kind == "voice":
+                text_preview = "🎤 Voice message"
+            elif kind == "file":
+                if media_name:
+                    text_preview = f"📎 {media_name}"
+                else:
+                    text_preview = "📎 File"
+            else:
+                text_preview = ""
+
         out.append(ConversationOut(
             user_id=u.id,
             username=u.username,
@@ -1408,7 +1431,7 @@ def conversations(user: User = Depends(get_current_user),
             avatar=(u.avatar if u.deleted_at is None else None),
             is_bot=u.is_bot,
             is_deleted=(u.deleted_at is not None),
-            last_message=preview,
+            last_message=text_preview,
             last_timestamp=created_at.isoformat(),
             online=(is_online(u) if (u.is_bot or u.show_online) else None),
             last_seen_text=(humanize_last_seen(u) if (u.is_bot or u.show_online) else None),
