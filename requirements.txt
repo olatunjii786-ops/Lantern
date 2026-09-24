@@ -9,3 +9,4 @@ pydantic[email]
 python-multipart
 pillow
 boto3
+psycopg
