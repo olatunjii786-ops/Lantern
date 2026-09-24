@@ -1247,8 +1247,8 @@ def post_global_room_message(data: SendRoomMessageIn,
                              user: User = Depends(get_current_user),
                              db: Session = Depends(get_db)):
     msg_type = (data.type or "text").strip().lower()
-    if msg_type not in ("text", "image", "file", "voice"):
-        raise HTTPException(status_code=400, detail="Invalid message type")
+if msg_type not in ("text", "image", "file", "voice", "video"):
+    raise HTTPException(status_code=400, detail="Invalid message type")
 
     content = (data.content or "").strip()
 
@@ -1544,8 +1544,8 @@ def post_message(data: SendMessageIn,
                  user: User = Depends(get_current_user),
                  db: Session = Depends(get_db)):
     msg_type = (data.type or "text").strip().lower()
-    if msg_type not in ("text", "image", "file", "voice"):
-        raise HTTPException(status_code=400, detail="Invalid message type")
+if msg_type not in ("text", "image", "file", "voice", "video"):
+    raise HTTPException(status_code=400, detail="Invalid message type")
 
     content = (data.content or "").strip()
 

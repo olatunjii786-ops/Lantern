@@ -8,11 +8,11 @@ Attaches itself to the app defined in main.py. Exposes:
 
 Contents (Phase A):
 - Backblaze B2 client via the S3-compatible API (boto3)
-- /media/upload + /media/sign endpoints
-- Media messages (image / file / voice)
-- Message reactions (add / remove / list)
-- Presence in the Global Room (WS broadcast + REST list)
-- Daily quote bot post (ZenQuotes + Lantern-themed drawn card)
+- /media/upload + /media/sign endpoints (images, files, videos, voice)
+- Media messages
+- Message reactions
+- Presence in the Global Room
+- Daily quote bot post
 - Welcome-in-room announcement on register
 """
 
@@ -30,8 +30,6 @@ from pydantic import BaseModel
 from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, UniqueConstraint, func
 from sqlalchemy.orm import Session
 
-# These imports reach into main.py. They only work because
-# register_features() is called at the very bottom of main.py.
 from main import (
     SessionLocal,
     Base,
@@ -67,7 +65,7 @@ else:
 
 SIGNED_URL_TTL_SECONDS = 7 * 24 * 60 * 60
 
-MAX_UPLOAD_BYTES = 15 * 1024 * 1024
+MAX_UPLOAD_BYTES = 100 * 1024 * 1024
 IMAGE_TARGET_MAX_DIM = 1600
 IMAGE_JPEG_QUALITY = 82
 THUMB_TARGET_MAX_DIM = 240
@@ -79,7 +77,7 @@ DAILY_QUOTE_MINUTE_UTC = int(os.environ.get("DAILY_QUOTE_MINUTE_UTC", "0"))
 
 
 # ---------------------------------------------------------------------
-# B2 client via S3-compatible API (boto3)
+# B2 client
 # ---------------------------------------------------------------------
 
 import boto3
@@ -251,6 +249,7 @@ class UploadResult(BaseModel):
 @media_router.post("/upload", response_model=UploadResult)
 async def upload_media(
     file: UploadFile = File(...),
+    thumb: UploadFile = File(None),
     kind: str = Form("auto"),
     user: User = Depends(get_current_user),
 ):
@@ -262,19 +261,23 @@ async def upload_media(
     if size == 0:
         raise HTTPException(status_code=400, detail="Empty file")
     if size > MAX_UPLOAD_BYTES:
-        raise HTTPException(status_code=413, detail="File too large (max 15 MB)")
+        raise HTTPException(status_code=413,
+                            detail=f"File too large (max {MAX_UPLOAD_BYTES // (1024*1024)} MB)")
 
     declared_ct = (file.content_type or "application/octet-stream").lower()
     original_name = file.filename or "file"
 
     is_image = declared_ct.startswith("image/")
     is_audio = declared_ct.startswith("audio/")
+    is_video = declared_ct.startswith("video/")
 
     if kind == "auto":
         if is_image:
             kind = "image"
         elif is_audio:
             kind = "voice"
+        elif is_video:
+            kind = "video"
         else:
             kind = "file"
 
@@ -300,7 +303,19 @@ async def upload_media(
         print(f"[features] upload failed: {e!r}")
         raise HTTPException(status_code=502, detail=f"Upload failed: {e}")
 
-    if thumb_bytes is not None:
+    # Client-supplied thumb (e.g. video first-frame) takes priority.
+    if thumb is not None:
+        try:
+            thumb_raw = await thumb.read()
+            if thumb_raw:
+                thumb_ct_client = (thumb.content_type or "image/jpeg").lower()
+                thumb_ext = _ext_for_ct(thumb_ct_client, "thumb.jpg")
+                thumb_key = f"media/{user.id}/thumbs/{uuid.uuid4().hex}{thumb_ext}"
+                upload_bytes(thumb_raw, thumb_key, thumb_ct_client)
+        except Exception as e:
+            print(f"[features] client thumb upload failed: {e!r}")
+            thumb_key = None
+    elif thumb_bytes is not None:
         thumb_key = f"media/{user.id}/thumbs/{uuid.uuid4().hex}.jpg"
         try:
             upload_bytes(thumb_bytes, thumb_key, thumb_ct or "image/jpeg")
@@ -359,6 +374,9 @@ def _ext_for_ct(ct: str, original_name: str) -> str:
     if ct == "audio/ogg":  return ".ogg"
     if ct == "audio/webm": return ".webm"
     if ct == "video/mp4":  return ".mp4"
+    if ct == "video/quicktime": return ".mov"
+    if ct == "video/x-matroska": return ".mkv"
+    if ct == "video/webm": return ".webm"
     if ct == "application/pdf": return ".pdf"
     if "." in original_name:
         ext = "." + original_name.rsplit(".", 1)[-1].lower()
@@ -457,11 +475,10 @@ def get_reactions(message_id: int,
 
 
 # ---------------------------------------------------------------------
-# Presence — in-memory, driven by WS connections
+# Presence
 # ---------------------------------------------------------------------
 
 def online_user_ids() -> list:
-    """Return the list of user ids with at least one live WS socket."""
     try:
         return [uid for uid, socks in manager.active.items() if socks]
     except Exception:
@@ -486,21 +503,12 @@ def room_presence(user: User = Depends(get_current_user),
 
     out = []
     for u in users:
-        out.append({
-            "id": u.id,
-            "username": u.username,
-            "avatar": u.avatar,
-        })
+        out.append({"id": u.id, "username": u.username, "avatar": u.avatar})
 
     return {"online": out, "count": len(out)}
 
 
 async def _broadcast_presence():
-    """
-    Push the current online roster to every connected socket.
-    Opens its own DB session inside the async task, uses it, closes it.
-    No session ever crosses an async boundary, so no connections leak.
-    """
     ids = online_user_ids()
     users = []
     if ids:
@@ -532,7 +540,6 @@ async def _broadcast_presence():
 
 
 def presence_on_connect(user_id: int):
-    """Fire-and-forget presence broadcast. Owns no session."""
     try:
         loop = asyncio.get_event_loop()
         if loop.is_running():
@@ -542,7 +549,6 @@ def presence_on_connect(user_id: int):
 
 
 def presence_on_disconnect(user_id: int):
-    """Fire-and-forget presence broadcast. Owns no session."""
     try:
         loop = asyncio.get_event_loop()
         if loop.is_running():
@@ -552,7 +558,7 @@ def presence_on_disconnect(user_id: int):
 
 
 # ---------------------------------------------------------------------
-# Daily quote — fetch, draw, upload, post
+# Daily quote
 # ---------------------------------------------------------------------
 
 ZENQUOTES_URL = "https://zenquotes.io/api/today"
@@ -582,10 +588,6 @@ def _fetch_today_quote() -> Optional[dict]:
 
 
 def _palette_for_weekday(weekday: int):
-    """
-    weekday: 0 = Monday, 6 = Sunday.
-    Returns (top_rgb, bottom_rgb, glow_rgb, lantern_rgb).
-    """
     palettes = {
         0: ((20, 30, 70), (10, 15, 40), (90, 130, 220), (200, 220, 255)),
         1: ((20, 60, 50), (10, 35, 30), (90, 200, 160), (200, 255, 230)),
@@ -635,7 +637,6 @@ def _wrap_text(text: str, font, max_width: int, draw):
 
 
 def _draw_lantern(size: int, body_rgb, glow_rgb):
-    """Draw a lantern as a transparent RGBA PIL Image of the given square size."""
     from PIL import Image, ImageDraw
 
     img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
@@ -645,14 +646,12 @@ def _draw_lantern(size: int, body_rgb, glow_rgb):
     cy = size * 0.56
     r = size * 0.30
 
-    # Halo
     for i in range(50, 0, -1):
         rr = r * (2.2 * i / 50)
         alpha = int(50 * (1 - i / 50))
         d.ellipse([cx - rr, cy - rr, cx + rr, cy + rr],
                   fill=(glow_rgb[0], glow_rgb[1], glow_rgb[2], alpha))
 
-    # Handle arc
     handle_w = max(3, int(size * 0.020))
     d.arc(
         [cx - r * 0.55, cy - r * 1.45, cx + r * 0.55, cy - r * 0.20],
@@ -661,7 +660,6 @@ def _draw_lantern(size: int, body_rgb, glow_rgb):
         width=handle_w,
     )
 
-    # Body — soft glowing circle
     for i in range(40, 0, -1):
         rr = r * i / 40
         t = i / 40.0
@@ -672,13 +670,11 @@ def _draw_lantern(size: int, body_rgb, glow_rgb):
         d.ellipse([cx - rr, cy - rr, cx + rr, cy + rr],
                   fill=(br, bg, bb, alpha))
 
-    # Highlight
     d.ellipse(
         [cx - r * 0.42, cy - r * 0.42, cx - r * 0.10, cy - r * 0.10],
         fill=(255, 255, 255, 140),
     )
 
-    # Base bar
     bar_w = r * 1.7
     bar_h = max(4, int(size * 0.018))
     d.rounded_rectangle(
@@ -691,7 +687,6 @@ def _draw_lantern(size: int, body_rgb, glow_rgb):
 
 
 def _draw_rising_sun(size: int, sun_rgb):
-    """Draw a simple rising sun with rays as an RGBA image."""
     from PIL import Image, ImageDraw
     import math
 
@@ -702,11 +697,9 @@ def _draw_rising_sun(size: int, sun_rgb):
     cy = size * 0.62
     r = size * 0.24
 
-    # Disc
     d.ellipse([cx - r, cy - r, cx + r, cy + r],
               fill=(sun_rgb[0], sun_rgb[1], sun_rgb[2], 255))
 
-    # Rays
     ray_len = size * 0.12
     ray_w = max(2, int(size * 0.035))
     for k in range(8):
@@ -719,7 +712,6 @@ def _draw_rising_sun(size: int, sun_rgb):
                fill=(sun_rgb[0], sun_rgb[1], sun_rgb[2], 255),
                width=ray_w)
 
-    # Horizon bar
     ground_y = cy + r + size * 0.06
     d.rounded_rectangle(
         [cx - size * 0.32, ground_y, cx + size * 0.32, ground_y + max(3, size * 0.03)],
@@ -731,21 +723,11 @@ def _draw_rising_sun(size: int, sun_rgb):
 
 
 def _draw_quote_card(quote_text: str, author: str, weekday: int) -> bytes:
-    """
-    Render a Lantern-themed quote card and return JPEG bytes.
-    Layout:
-      - gradient background with soft radial glow
-      - large faint lantern watermark behind the quote
-      - small drawn sun + "Good morning, Lantern" header
-      - quote centered, author below
-      - ZenQuotes attribution at the bottom
-    """
     from PIL import Image, ImageDraw
 
     W, H = 1080, 1350
     top_rgb, bot_rgb, glow_rgb, lantern_rgb = _palette_for_weekday(weekday)
 
-    # Base gradient
     img = Image.new("RGB", (W, H), top_rgb)
     draw = ImageDraw.Draw(img)
     for y in range(H):
@@ -755,7 +737,6 @@ def _draw_quote_card(quote_text: str, author: str, weekday: int) -> bytes:
         b = int(top_rgb[2] * (1 - t) + bot_rgb[2] * t)
         draw.line([(0, y), (W, y)], fill=(r, g, b))
 
-    # Soft radial glow
     glow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     gd = ImageDraw.Draw(glow)
     cx, cy, radius = int(W * 0.5), int(H * 0.28), int(W * 0.60)
@@ -767,7 +748,6 @@ def _draw_quote_card(quote_text: str, author: str, weekday: int) -> bytes:
                    fill=(glow_rgb[0], glow_rgb[1], glow_rgb[2], alpha))
     img = Image.alpha_composite(img.convert("RGBA"), glow).convert("RGB")
 
-    # Big faint lantern watermark
     wm_size = int(W * 0.85)
     wm = _draw_lantern(wm_size, lantern_rgb, glow_rgb)
     alpha = wm.split()[3]
@@ -780,7 +760,6 @@ def _draw_quote_card(quote_text: str, author: str, weekday: int) -> bytes:
     img = base.convert("RGB")
     draw = ImageDraw.Draw(img)
 
-    # Header: small sun + "Good morning, Lantern"
     header_font = _load_font(36, bold=True)
     sun_size = 60
     sun_img = _draw_rising_sun(sun_size, (255, 235, 190))
@@ -802,14 +781,9 @@ def _draw_quote_card(quote_text: str, author: str, weekday: int) -> bytes:
     img = base.convert("RGB")
     draw = ImageDraw.Draw(img)
 
-    draw.text(
-        (start_x + sun_size + gap, header_y),
-        header_text,
-        font=header_font,
-        fill=(255, 255, 255),
-    )
+    draw.text((start_x + sun_size + gap, header_y),
+              header_text, font=header_font, fill=(255, 255, 255))
 
-    # Quote text
     quote_font = _load_font(72, bold=False)
     author_font = _load_font(42, bold=False)
 
@@ -830,7 +804,6 @@ def _draw_quote_card(quote_text: str, author: str, weekday: int) -> bytes:
                   font=quote_font, fill=(255, 255, 255))
         y += line_h
 
-    # Author
     author_line = f"— {author}"
     try:
         aw = draw.textlength(author_line, font=author_font)
@@ -839,7 +812,6 @@ def _draw_quote_card(quote_text: str, author: str, weekday: int) -> bytes:
     draw.text(((W - aw) / 2, y + 50), author_line,
               font=author_font, fill=(235, 235, 245))
 
-    # Attribution
     attr = "Powered by ZenQuotes"
     attr_font = _load_font(22, bold=False)
     try:
@@ -891,7 +863,7 @@ def post_daily_quote_once() -> bool:
             thumb_key = None
 
         room = get_global_room(db)
-        caption = f"🌅 Good morning, Lantern.\n\n\"{text}\"\n— {author}"
+        caption = f'"{text}"\n— {author}'
 
         msg = Message(
             sender_id=bot.id,
@@ -1030,7 +1002,7 @@ def post_welcome_in_room(new_user_id: int, new_username: str):
 
 
 # ---------------------------------------------------------------------
-# Message serialization helpers (called from main.py)
+# Message serialization helpers
 # ---------------------------------------------------------------------
 
 def decorate_message_dict(msg: Message, d: dict) -> dict:
@@ -1058,7 +1030,7 @@ def decorate_message_dict(msg: Message, d: dict) -> dict:
 
 
 # ---------------------------------------------------------------------
-# WebSocket dispatch — called from main.py
+# WebSocket dispatch
 # ---------------------------------------------------------------------
 
 def handle_feature_ws(user_id: int, username: str, db: Session,
@@ -1071,7 +1043,6 @@ def handle_feature_ws(user_id: int, username: str, db: Session,
 # ---------------------------------------------------------------------
 
 def register_features(app):
-    """Called at the very bottom of main.py."""
     app.include_router(media_router)
     app.include_router(reactions_router)
     app.include_router(presence_router)
