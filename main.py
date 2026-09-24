@@ -5,13 +5,12 @@ Single-file backend for the Lantern chat app.
 Includes:
 - Auth, profile, discover, search, conversations, messages
 - Read tracking, soft-delete, typing events
-- WhatsApp-style swipe-to-reply (reply_to_id + reply preview)
-- Edit within 20 minutes + "edited" tag
-- Media messages (image / file / voice) — endpoints + WS transport
-- Message reactions (add / remove / list)
-- Global Room — one room everyone is in, with unread counts and members list
-- Presence (in-memory + WS broadcast)
-- Release / update system + admin panel + broadcast
+- Swipe-to-reply, edit within 20 minutes
+- Media messages (image / file / voice / video)
+- Message reactions
+- Presence in the Global Room
+- Daily quote bot post
+- Global Room, releases / admin panel, broadcast
 - Bot account ("thegoodboy")
 
 Phase A+ features live in features.py and are registered at the bottom.
@@ -56,9 +55,6 @@ DEFAULT_ROOM_NAME = "Global Room"
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL environment variable is required")
 
-# Pool sizing: Neon free tier allows ~100 connections total across a project.
-# 10 + 20 overflow = 30 concurrent from this instance, which is comfortable
-# and prevents the QueuePool exhaustion that killed WS under load.
 engine = create_engine(
     DATABASE_URL,
     pool_pre_ping=True,
@@ -311,7 +307,7 @@ def bot_reply(db: Session, user: User, text: str) -> str:
             "• Open any chat and tap the attachment icon\n"
             "• Pick an image or file from your phone\n"
             "• Add an optional caption, then send\n\n"
-            "You can send photos, files, and voice notes."
+            "You can send photos, videos, files, and voice notes."
         )
 
     if "room" in t or "global" in t:
@@ -772,11 +768,6 @@ def public_view_of(user: User) -> PublicUserOut:
 
 
 def _media_fields_for_message(msg: Message) -> dict:
-    """
-    Build the media-related fields for any message payload (REST or WS).
-    For text messages, everything is None. For media messages, it signs
-    the key into a fresh URL.
-    """
     try:
         from features import signed_url_for_key
     except Exception:
@@ -817,11 +808,6 @@ def _media_fields_for_message(msg: Message) -> dict:
 
 
 def _reaction_fields_for_message(msg: Message, db: Session, me_id: int) -> dict:
-    """
-    Return {"reactions": [...]} for a message. The array is grouped by
-    emoji: [{"emoji": "❤️", "count": 3, "mine": true}, ...].
-    Delegates to features.py; returns [] if features isn't available.
-    """
     try:
         from features import reactions_for_message
         return {"reactions": reactions_for_message(db, msg.id, me_id)}
@@ -1160,6 +1146,8 @@ def get_global_room_info(user: User = Depends(get_current_user),
             if not text:
                 if (last.type or "text") == "image":
                     text = "📷 Photo"
+                elif (last.type or "text") == "video":
+                    text = "🎬 Video"
                 elif (last.type or "text") == "voice":
                     text = "🎤 Voice message"
                 elif (last.type or "text") == "file":
@@ -1247,8 +1235,8 @@ def post_global_room_message(data: SendRoomMessageIn,
                              user: User = Depends(get_current_user),
                              db: Session = Depends(get_db)):
     msg_type = (data.type or "text").strip().lower()
-if msg_type not in ("text", "image", "file", "voice", "video"):
-    raise HTTPException(status_code=400, detail="Invalid message type")
+    if msg_type not in ("text", "image", "file", "voice", "video"):
+        raise HTTPException(status_code=400, detail="Invalid message type")
 
     content = (data.content or "").strip()
 
@@ -1544,8 +1532,8 @@ def post_message(data: SendMessageIn,
                  user: User = Depends(get_current_user),
                  db: Session = Depends(get_db)):
     msg_type = (data.type or "text").strip().lower()
-if msg_type not in ("text", "image", "file", "voice", "video"):
-    raise HTTPException(status_code=400, detail="Invalid message type")
+    if msg_type not in ("text", "image", "file", "voice", "video"):
+        raise HTTPException(status_code=400, detail="Invalid message type")
 
     content = (data.content or "").strip()
 
@@ -2370,14 +2358,8 @@ manager = ConnectionManager()
 
 
 def _ws_handle_message(db: Session, user_id: int, username: str, data: dict) -> None:
-    """
-    Handle a single inbound WS message. Opens and closes its own DB
-    operations but reuses the session passed in (which lives for one
-    message, not for the whole socket lifetime).
-    """
     msg_type = (data.get("type") or "message").strip()
 
-    # Feature hook (reactions, presence events, future groups, etc.)
     try:
         from features import handle_feature_ws
         if handle_feature_ws(user_id, username, db, msg_type, data):
@@ -2495,7 +2477,6 @@ def _ws_handle_message(db: Session, user_id: int, username: str, data: dict) -> 
             pass
         return
 
-    # Regular DM
     receiver_id = data.get("to")
     content = (data.get("content") or "").strip()
 
@@ -2596,7 +2577,6 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
     user_id = int(payload["sub"])
     username = payload["username"]
 
-    # One-time auth check with a short-lived session.
     db0 = SessionLocal()
     try:
         u0 = db0.query(User).filter(User.id == user_id).first()
@@ -2614,14 +2594,11 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
     except Exception as e:
         print(f"[ws] presence_on_connect error: {e!r}")
 
-    # Per-message DB session: opened and closed for each inbound frame.
-    # Nothing is held for the lifetime of the socket.
     try:
         while True:
             data = await websocket.receive_json()
             db = SessionLocal()
             try:
-                # Touch last_seen once per message.
                 u = db.query(User).filter(User.id == user_id).first()
                 if u and not u.is_bot:
                     u.last_seen = datetime.utcnow()
