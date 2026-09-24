@@ -558,6 +558,289 @@ def presence_on_disconnect(user_id: int):
 
 
 # ---------------------------------------------------------------------
+# Stickers
+# ---------------------------------------------------------------------
+#
+# Two-stage flow:
+#   1. Browse — GET /stickers/browse proxies KLIPY (a free GIPHY/Tenor
+#      alternative; Tenor's third-party API was retired in 2026) and
+#      returns lightweight preview data. Nothing is saved yet.
+#   2. Download — POST /stickers/download fetches the chosen sticker's
+#      bytes server-side and re-uploads them into our own B2 storage via
+#      the same upload_bytes/signed_url_for_key pipeline used for chat
+#      media, then records it against the user. Sent stickers always
+#      resolve through our own signed URLs, never a hot-linked KLIPY URL,
+#      so they don't break if KLIPY changes or goes down later.
+#
+# GET /stickers/mine returns what the user has already downloaded, for
+# populating their sticker tray.
+
+KLIPY_API_KEY = os.environ.get("KLIPY_API_KEY", "")
+KLIPY_BASE_URL = "https://api.klipy.com/api/v1"
+STICKER_USER_AGENT = "Lantern/1.0 (+https://lantern-dhhb.onrender.com)"
+
+
+class StickerPack(Base):
+    __tablename__ = "sticker_packs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    source = Column(String, nullable=False, default="klipy")      # "klipy" | "custom"
+    source_pack_id = Column(String, nullable=True, index=True)     # id/slug from KLIPY, null for custom
+    name = Column(String, nullable=False)
+    thumb_url = Column(String, nullable=True)                      # our own signed/cached thumb, if any
+    owner_id = Column(Integer, ForeignKey("users.id"), nullable=True)  # set for a user's custom pack
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("source", "source_pack_id", name="uq_sticker_pack_source"),
+    )
+
+
+class Sticker(Base):
+    __tablename__ = "stickers"
+
+    id = Column(Integer, primary_key=True, index=True)
+    pack_id = Column(Integer, ForeignKey("sticker_packs.id"), nullable=False, index=True)
+    media_key = Column(String, nullable=False)     # our own B2 key — always what gets sent in chat
+    source_url = Column(String, nullable=True)      # original KLIPY url, kept for reference/re-download
+    width = Column(Integer, nullable=True)
+    height = Column(Integer, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class UserStickerPack(Base):
+    __tablename__ = "user_sticker_packs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    pack_id = Column(Integer, ForeignKey("sticker_packs.id"), nullable=False, index=True)
+    downloaded_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "pack_id", name="uq_user_pack_once"),
+    )
+
+
+for _model in (StickerPack, Sticker, UserStickerPack):
+    try:
+        _model.__table__.create(bind=engine, checkfirst=True)
+    except Exception as e:
+        print(f"[features] could not create {_model.__tablename__} table: {e!r}")
+
+
+sticker_router = APIRouter(prefix="/stickers", tags=["stickers"])
+
+
+def _klipy_get(path: str, params: dict) -> Optional[dict]:
+    if not KLIPY_API_KEY:
+        return None
+    import json as _json
+    import urllib.parse as _urlparse
+
+    qs = _urlparse.urlencode(params)
+    url = f"{KLIPY_BASE_URL}/{KLIPY_API_KEY}/{path}?{qs}"
+    try:
+        req = urllib.request.Request(url)
+        req.add_header("User-Agent", STICKER_USER_AGENT)
+        req.add_header("Accept", "application/json")
+        with urllib.request.urlopen(req, timeout=15) as r:
+            data = r.read().decode("utf-8")
+        parsed = _json.loads(data)
+        if not parsed.get("result"):
+            return None
+        return parsed.get("data")
+    except Exception as e:
+        print(f"[features] klipy request failed: {e!r}")
+        return None
+
+
+class StickerPreview(BaseModel):
+    source_id: str
+    title: str
+    preview_url: str
+    full_url: str
+    width: Optional[int] = None
+    height: Optional[int] = None
+
+
+class BrowseStickersOut(BaseModel):
+    items: List[StickerPreview]
+    has_next: bool
+    page: int
+
+
+@sticker_router.get("/browse", response_model=BrowseStickersOut)
+def browse_stickers(
+    q: str = "",
+    page: int = 1,
+    user: User = Depends(get_current_user),
+):
+    """Preview-only — nothing is saved. The client shows these with a
+    download button; only /stickers/download persists anything."""
+    path = "stickers/search" if q.strip() else "stickers/trending"
+    params = {"page": page, "per_page": 30}
+    if q.strip():
+        params["q"] = q.strip()
+
+    data = _klipy_get(path, params)
+    if data is None:
+        raise HTTPException(status_code=503, detail="Sticker source unavailable")
+
+    rows = data.get("data", [])
+    items = []
+    for row in rows:
+        files = row.get("files") or {}
+        # KLIPY returns a few size variants per item; take the largest for
+        # "full" and a smaller one for the grid preview if available.
+        best = None
+        for variant in files.values():
+            if isinstance(variant, dict) and variant.get("url"):
+                if best is None or (variant.get("width", 0) > best.get("width", 0)):
+                    best = variant
+        if not best:
+            continue
+        preview = None
+        for variant in files.values():
+            if isinstance(variant, dict) and variant.get("url"):
+                if preview is None or (variant.get("width", 99999) < preview.get("width", 99999)):
+                    preview = variant
+        items.append(StickerPreview(
+            source_id=str(row.get("id") or row.get("slug") or ""),
+            title=row.get("title", ""),
+            preview_url=(preview or best)["url"],
+            full_url=best["url"],
+            width=best.get("width"),
+            height=best.get("height"),
+        ))
+
+    return BrowseStickersOut(
+        items=items,
+        has_next=bool(data.get("has_next", False)),
+        page=data.get("current_page", page),
+    )
+
+
+def _fetch_bytes(url: str) -> Optional[bytes]:
+    try:
+        req = urllib.request.Request(url)
+        req.add_header("User-Agent", STICKER_USER_AGENT)
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return r.read()
+    except Exception as e:
+        print(f"[features] sticker fetch failed: {e!r}")
+        return None
+
+
+class DownloadStickerIn(BaseModel):
+    source_id: str
+    title: str = ""
+    full_url: str
+    width: Optional[int] = None
+    height: Optional[int] = None
+
+
+@sticker_router.post("/download")
+def download_sticker(
+    body: DownloadStickerIn,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if not (B2_KEY_ID and B2_APP_KEY and B2_ENDPOINT_URL and B2_BUCKET_NAME):
+        raise HTTPException(status_code=503, detail="Media storage not configured")
+
+    pack = (db.query(StickerPack)
+            .filter(StickerPack.source == "klipy",
+                    StickerPack.source_pack_id == body.source_id)
+            .first())
+    if pack is None:
+        pack = StickerPack(source="klipy", source_pack_id=body.source_id,
+                            name=body.title or "Sticker", thumb_url=body.full_url)
+        db.add(pack)
+        db.commit()
+        db.refresh(pack)
+
+    sticker = db.query(Sticker).filter(Sticker.pack_id == pack.id).first()
+    if sticker is None:
+        raw = _fetch_bytes(body.full_url)
+        if raw is None:
+            raise HTTPException(status_code=502, detail="Could not fetch sticker")
+        ct = "image/webp" if body.full_url.lower().endswith(".webp") else "image/png"
+        key = f"stickers/{uuid.uuid4().hex}{_ext_for_ct(ct, 'sticker.webp')}"
+        try:
+            upload_bytes(raw, key, ct)
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"Upload failed: {e}")
+        sticker = Sticker(pack_id=pack.id, media_key=key, source_url=body.full_url,
+                          width=body.width, height=body.height)
+        db.add(sticker)
+        db.commit()
+        db.refresh(sticker)
+
+    existing_link = (db.query(UserStickerPack)
+                     .filter(UserStickerPack.user_id == user.id,
+                             UserStickerPack.pack_id == pack.id)
+                     .first())
+    if existing_link is None:
+        db.add(UserStickerPack(user_id=user.id, pack_id=pack.id))
+        db.commit()
+
+    return {
+        "pack_id": pack.id,
+        "sticker_id": sticker.id,
+        "media_url": signed_url_for_key(sticker.media_key),
+    }
+
+
+class MyStickerOut(BaseModel):
+    sticker_id: int
+    media_url: str
+    width: Optional[int] = None
+    height: Optional[int] = None
+
+
+class MyPackOut(BaseModel):
+    pack_id: int
+    name: str
+    stickers: List[MyStickerOut]
+
+
+@sticker_router.get("/mine", response_model=List[MyPackOut])
+def my_stickers(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    links = (db.query(UserStickerPack)
+            .filter(UserStickerPack.user_id == user.id)
+            .order_by(UserStickerPack.downloaded_at.desc())
+            .all())
+    if not links:
+        return []
+
+    pack_ids = [l.pack_id for l in links]
+    packs = {p.id: p for p in db.query(StickerPack).filter(StickerPack.id.in_(pack_ids)).all()}
+    stickers_by_pack = {}
+    for s in db.query(Sticker).filter(Sticker.pack_id.in_(pack_ids)).all():
+        stickers_by_pack.setdefault(s.pack_id, []).append(s)
+
+    out = []
+    for link in links:
+        pack = packs.get(link.pack_id)
+        if pack is None:
+            continue
+        rows = stickers_by_pack.get(pack.id, [])
+        out.append(MyPackOut(
+            pack_id=pack.id,
+            name=pack.name,
+            stickers=[MyStickerOut(
+                sticker_id=s.id,
+                media_url=signed_url_for_key(s.media_key) or "",
+                width=s.width, height=s.height,
+            ) for s in rows],
+        ))
+    return out
+
+
+# ---------------------------------------------------------------------
 # Daily quote
 # ---------------------------------------------------------------------
 
@@ -1046,6 +1329,7 @@ def register_features(app):
     app.include_router(media_router)
     app.include_router(reactions_router)
     app.include_router(presence_router)
+    app.include_router(sticker_router)
 
     @app.on_event("startup")
     def _features_startup():
@@ -1059,6 +1343,13 @@ def register_features(app):
             print("[features] message_reactions table ready")
         except Exception as e:
             print(f"[features] message_reactions table create failed: {e!r}")
+        for _model in (StickerPack, Sticker, UserStickerPack):
+            try:
+                _model.__table__.create(bind=engine, checkfirst=True)
+            except Exception as e:
+                print(f"[features] {_model.__tablename__} table create failed: {e!r}")
+        if not KLIPY_API_KEY:
+            print("[features] KLIPY_API_KEY not set — sticker browsing will be unavailable")
 
         try:
             loop = asyncio.get_event_loop()
