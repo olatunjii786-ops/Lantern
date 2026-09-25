@@ -793,6 +793,7 @@ def download_sticker(
 
 class MyStickerOut(BaseModel):
     sticker_id: int
+    media_key: str
     media_url: str
     width: Optional[int] = None
     height: Optional[int] = None
@@ -833,6 +834,7 @@ def my_stickers(
             name=pack.name,
             stickers=[MyStickerOut(
                 sticker_id=s.id,
+                media_key=s.media_key,
                 media_url=signed_url_for_key(s.media_key) or "",
                 width=s.width, height=s.height,
             ) for s in rows],
