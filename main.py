@@ -24,6 +24,7 @@ from typing import Optional, List
 
 import bcrypt
 from jose import jwt, JWTError
+from jose.exceptions import ExpiredSignatureError
 from fastapi import FastAPI, Depends, HTTPException, WebSocket, WebSocketDisconnect, Query, Header
 from fastapi.responses import HTMLResponse
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
@@ -638,11 +639,28 @@ TOKEN_GRACE_DAYS = 60
 
 
 def decode_token(token: str) -> Optional[dict]:
+    # python-jose's jwt.decode has no `leeway` kwarg (that's PyJWT, a
+    # different package) — it only exposes an options dict that can turn
+    # expiry checking off entirely. So we verify everything normally
+    # first; only if that fails specifically on expiry do we re-check the
+    # exp claim ourselves against the grace window.
     try:
-        return jwt.decode(
-            token, SECRET_KEY, algorithms=[ALGORITHM],
-            leeway=timedelta(days=TOKEN_GRACE_DAYS),
-        )
+        return jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+    except ExpiredSignatureError:
+        try:
+            payload = jwt.decode(
+                token, SECRET_KEY, algorithms=[ALGORITHM],
+                options={"verify_exp": False},
+            )
+        except JWTError:
+            return None
+        exp = payload.get("exp")
+        if exp is None:
+            return None
+        expired_at = datetime.utcfromtimestamp(exp)
+        if datetime.utcnow() - expired_at > timedelta(days=TOKEN_GRACE_DAYS):
+            return None
+        return payload
     except JWTError:
         return None
 
