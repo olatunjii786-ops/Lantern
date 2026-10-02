@@ -710,10 +710,12 @@ async def admin_import_stickers(
         if ct is None:
             skipped += 1
             continue
+        raw = None
         try:
             raw = zf.read(info)
             if not raw:
                 skipped += 1
+                errors.append(f"{base}: empty (0 bytes) in zip")
                 continue
             key = f"stickers/{uuid.uuid4().hex}{ext}"
             upload_bytes(raw, key, ct)
@@ -721,7 +723,13 @@ async def admin_import_stickers(
             added += 1
         except Exception as e:
             skipped += 1
-            errors.append(f"{base}: {e}")
+            # First 16 bytes in hex tell us what the file actually is —
+            # a real webp always starts with "52494646" (RIFF); anything
+            # else (e.g. all zeros, or a different signature) tells us
+            # immediately what's actually wrong instead of guessing.
+            head_hex = raw[:16].hex() if raw else "(no bytes read)"
+            errors.append(f"{base}: {len(raw) if raw else 0} bytes, "
+                          f"starts with {head_hex} — {e}")
 
     db.commit()
     return AdminImportResult(
