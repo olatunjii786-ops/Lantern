@@ -43,9 +43,7 @@ from main import (
     get_global_room,
     get_bot,
     display_name_of,
-    require_admin,
 )
-from fastapi import Header
 
 # ---------------------------------------------------------------------
 # Config
@@ -656,39 +654,6 @@ def _klipy_get(path: str, params: dict) -> Optional[dict]:
         return None
 
 
-@sticker_router.get("/_debug_raw")
-def debug_klipy_raw(x_admin_key: Optional[str] = Header(None)):
-    """Temporary — logs and returns KLIPY's real, unparsed trending-stickers
-    response so we can confirm the actual item shape instead of guessing
-    at it. Remove once /stickers/browse is confirmed working against it."""
-    require_admin(x_admin_key)
-    if not KLIPY_API_KEY:
-        raise HTTPException(status_code=503, detail="KLIPY_API_KEY not set")
-
-    import json as _json
-    import urllib.parse as _urlparse
-
-    params = {"page": 1, "per_page": 5}
-    qs = _urlparse.urlencode(params)
-    url = f"{KLIPY_BASE_URL}/{KLIPY_API_KEY}/stickers/trending?{qs}"
-    try:
-        req = urllib.request.Request(url)
-        req.add_header("User-Agent", STICKER_USER_AGENT)
-        req.add_header("Accept", "application/json")
-        with urllib.request.urlopen(req, timeout=15) as r:
-            raw = r.read().decode("utf-8")
-    except Exception as e:
-        print(f"[features] debug klipy raw fetch failed: {e!r}")
-        raise HTTPException(status_code=502, detail=f"KLIPY request failed: {e}")
-
-    print(f"[features] KLIPY raw trending response: {raw[:4000]}")
-    try:
-        parsed = _json.loads(raw)
-    except Exception:
-        parsed = {"_unparseable_raw": raw[:4000]}
-    return parsed
-
-
 class StickerPreview(BaseModel):
     source_id: str
     title: str
@@ -723,22 +688,30 @@ def browse_stickers(
 
     rows = data.get("data", [])
     items = []
+    # Real shape (confirmed against KLIPY's actual trending-stickers
+    # response): row["file"][size_tier][format] — size tiers are
+    # "hd"/"md"/"sm"/"xs" (largest to smallest), each holding format
+    # variants "gif"/"webp"/"webm"/"png". We want "png" specifically —
+    # it's the one static, transparent-background image suited to a
+    # chat sticker bubble; the others are animated (gif/webp/webm),
+    # which our sticker rendering doesn't support.
+    SIZE_TIERS = ("hd", "md", "sm", "xs")
     for row in rows:
-        files = row.get("files") or {}
-        # KLIPY returns a few size variants per item; take the largest for
-        # "full" and a smaller one for the grid preview if available.
+        file_obj = row.get("file") or {}
         best = None
-        for variant in files.values():
+        for tier in SIZE_TIERS:
+            variant = (file_obj.get(tier) or {}).get("png")
             if isinstance(variant, dict) and variant.get("url"):
-                if best is None or (variant.get("width", 0) > best.get("width", 0)):
-                    best = variant
+                best = variant
+                break
         if not best:
             continue
         preview = None
-        for variant in files.values():
+        for tier in reversed(SIZE_TIERS):
+            variant = (file_obj.get(tier) or {}).get("png")
             if isinstance(variant, dict) and variant.get("url"):
-                if preview is None or (variant.get("width", 99999) < preview.get("width", 99999)):
-                    preview = variant
+                preview = variant
+                break
         items.append(StickerPreview(
             source_id=str(row.get("id") or row.get("slug") or ""),
             title=row.get("title", ""),
