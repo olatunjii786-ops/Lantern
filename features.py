@@ -25,9 +25,9 @@ import urllib.error
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List
 
-from fastapi import APIRouter, File, UploadFile, HTTPException, Form, Depends
+from fastapi import APIRouter, File, UploadFile, HTTPException, Form, Depends, Header
 from pydantic import BaseModel
-from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, UniqueConstraint, func
+from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, UniqueConstraint, func, Boolean
 from sqlalchemy.orm import Session
 
 from main import (
@@ -43,6 +43,8 @@ from main import (
     get_global_room,
     get_bot,
     display_name_of,
+    require_admin,
+    _ensure_column,
 )
 
 # ---------------------------------------------------------------------
@@ -584,11 +586,17 @@ class StickerPack(Base):
     __tablename__ = "sticker_packs"
 
     id = Column(Integer, primary_key=True, index=True)
-    source = Column(String, nullable=False, default="klipy")      # "klipy" | "custom"
-    source_pack_id = Column(String, nullable=True, index=True)     # id/slug from KLIPY, null for custom
+    source = Column(String, nullable=False, default="klipy")      # "klipy" | "custom" | "admin"
+    source_pack_id = Column(String, nullable=True, index=True)     # id/slug from KLIPY, null for custom/admin
     name = Column(String, nullable=False)
     thumb_url = Column(String, nullable=True)                      # our own signed/cached thumb, if any
     owner_id = Column(Integer, ForeignKey("users.id"), nullable=True)  # set for a user's custom pack
+    # Admin-curated packs (the bulk WhatsApp-folder import) are flagged
+    # is_default so every user sees them automatically — without this,
+    # "everyone has this pack" would mean one UserStickerPack row per
+    # user per pack, which doesn't scale for a 500-sticker pack shared
+    # by every user on the app.
+    is_default = Column(Boolean, nullable=False, default=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     __table_args__ = (
@@ -627,8 +635,99 @@ for _model in (StickerPack, Sticker, UserStickerPack):
     except Exception as e:
         print(f"[features] could not create {_model.__tablename__} table: {e!r}")
 
+# is_default was added after sticker_packs may already exist on a deployed
+# DB — plain create(checkfirst=True) above won't add a column to an
+# existing table, so ensure it explicitly.
+_ensure_column("sticker_packs", "is_default", "BOOLEAN", "FALSE")
+
 
 sticker_router = APIRouter(prefix="/stickers", tags=["stickers"])
+
+
+class AdminImportResult(BaseModel):
+    pack_id: int
+    pack_name: str
+    added: int
+    skipped: int
+    errors: List[str]
+
+
+_IMAGE_EXT_TO_CONTENT_TYPE = {
+    ".webp": "image/webp",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+}
+
+
+@sticker_router.post("/admin/import", response_model=AdminImportResult)
+async def admin_import_stickers(
+    pack_name: str = Form(...),
+    zip_file: UploadFile = File(...),
+    x_admin_key: Optional[str] = Header(None),
+    db: Session = Depends(get_db),
+):
+    """Bulk-import a zipped folder of sticker images (e.g. an exported
+    WhatsApp stickers folder, zipped) as one admin-curated pack, visible to
+    every user by default — no per-user download step. Call again with the
+    same pack_name to add more (e.g. if you're splitting a huge folder
+    into a few zips to stay under Render's request size limit)."""
+    require_admin(x_admin_key)
+    if not (B2_KEY_ID and B2_APP_KEY and B2_ENDPOINT_URL and B2_BUCKET_NAME):
+        raise HTTPException(status_code=503, detail="Media storage not configured")
+
+    raw_zip = await zip_file.read()
+    import zipfile, io as _io
+    try:
+        zf = zipfile.ZipFile(_io.BytesIO(raw_zip))
+    except zipfile.BadZipFile:
+        raise HTTPException(status_code=400, detail="That file isn't a valid zip")
+
+    pack = (db.query(StickerPack)
+            .filter(StickerPack.source == "admin", StickerPack.name == pack_name)
+            .first())
+    if pack is None:
+        pack = StickerPack(source="admin", source_pack_id=None,
+                           name=pack_name, is_default=True)
+        db.add(pack)
+        db.commit()
+        db.refresh(pack)
+
+    added = 0
+    skipped = 0
+    errors: List[str] = []
+
+    for info in zf.infolist():
+        if info.is_dir():
+            continue
+        name = info.filename
+        base = name.rsplit("/", 1)[-1]
+        if base.startswith(".") or base.startswith("__MACOSX"):
+            skipped += 1
+            continue
+        ext = ("." + base.rsplit(".", 1)[-1].lower()) if "." in base else ""
+        ct = _IMAGE_EXT_TO_CONTENT_TYPE.get(ext)
+        if ct is None:
+            skipped += 1
+            continue
+        try:
+            raw = zf.read(info)
+            if not raw:
+                skipped += 1
+                continue
+            key = f"stickers/{uuid.uuid4().hex}{ext}"
+            upload_bytes(raw, key, ct)
+            db.add(Sticker(pack_id=pack.id, media_key=key, source_url=None))
+            added += 1
+        except Exception as e:
+            skipped += 1
+            errors.append(f"{base}: {e}")
+
+    db.commit()
+    return AdminImportResult(
+        pack_id=pack.id, pack_name=pack.name,
+        added=added, skipped=skipped, errors=errors[:20],
+    )
 
 
 def _klipy_get(path: str, params: dict) -> Optional[dict]:
@@ -818,22 +917,33 @@ def my_stickers(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    # Default (admin-curated) packs are available to everyone automatically
+    # — no per-user download/link row needed, since that wouldn't scale for
+    # a large shared pack. Downloaded packs are whatever this user picked
+    # up individually from the Store tab.
+    default_packs = db.query(StickerPack).filter(StickerPack.is_default == True).all()  # noqa: E712
     links = (db.query(UserStickerPack)
             .filter(UserStickerPack.user_id == user.id)
             .order_by(UserStickerPack.downloaded_at.desc())
             .all())
-    if not links:
+
+    pack_ids = {p.id for p in default_packs} | {l.pack_id for l in links}
+    if not pack_ids:
         return []
 
-    pack_ids = [l.pack_id for l in links]
     packs = {p.id: p for p in db.query(StickerPack).filter(StickerPack.id.in_(pack_ids)).all()}
     stickers_by_pack = {}
     for s in db.query(Sticker).filter(Sticker.pack_id.in_(pack_ids)).all():
         stickers_by_pack.setdefault(s.pack_id, []).append(s)
 
+    # Default packs first, then downloaded packs most-recent-first.
+    ordered_pack_ids = [p.id for p in default_packs] + [
+        l.pack_id for l in links if l.pack_id not in {p.id for p in default_packs}
+    ]
+
     out = []
-    for link in links:
-        pack = packs.get(link.pack_id)
+    for pid in ordered_pack_ids:
+        pack = packs.get(pid)
         if pack is None:
             continue
         rows = stickers_by_pack.get(pack.id, [])
