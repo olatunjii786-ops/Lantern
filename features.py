@@ -738,6 +738,46 @@ async def admin_import_stickers(
     )
 
 
+class AdminDeletePackResult(BaseModel):
+    pack_id: int
+    deleted_stickers: int
+    storage_errors: int
+
+
+@sticker_router.delete("/admin/pack/{pack_id}", response_model=AdminDeletePackResult)
+def admin_delete_pack(
+    pack_id: int,
+    x_admin_key: Optional[str] = Header(None),
+    db: Session = Depends(get_db),
+):
+    """Delete an admin-imported pack entirely — its Sticker rows, its B2
+    objects, and any UserStickerPack links to it (for non-default packs).
+    Use this to clear a bad import (e.g. a zip that only partially
+    imported due to a corrupt zip structure) before re-importing cleanly."""
+    require_admin(x_admin_key)
+    pack = db.query(StickerPack).filter(StickerPack.id == pack_id).first()
+    if pack is None:
+        raise HTTPException(status_code=404, detail="Pack not found")
+
+    stickers = db.query(Sticker).filter(Sticker.pack_id == pack_id).all()
+    deleted = 0
+    storage_errors = 0
+    for s in stickers:
+        ok = delete_key(s.media_key)
+        if not ok:
+            storage_errors += 1
+        db.delete(s)
+        deleted += 1
+
+    db.query(UserStickerPack).filter(UserStickerPack.pack_id == pack_id).delete()
+    db.delete(pack)
+    db.commit()
+
+    return AdminDeletePackResult(
+        pack_id=pack_id, deleted_stickers=deleted, storage_errors=storage_errors,
+    )
+
+
 def _klipy_get(path: str, params: dict) -> Optional[dict]:
     if not KLIPY_API_KEY:
         return None
