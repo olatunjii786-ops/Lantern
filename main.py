@@ -624,9 +624,25 @@ def create_access_token(user_id: int, username: str) -> str:
     return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
 
 
+# Grace window for already-issued tokens that have technically expired.
+#
+# There is currently no refresh-token flow, and installed app builds have
+# no handling for a 401 caused by an expired token — they just keep
+# retrying the dead token and the user sees a frozen/broken app with no
+# way to recover short of knowing to log out and back in. Since fixing
+# that properly requires a client update we're not shipping yet, this
+# grace window keeps already-issued tokens working a while past their
+# original expiry, server-side only, so existing installs don't break.
+# This is a stopgap, not a replacement for a real refresh-token flow.
+TOKEN_GRACE_DAYS = 60
+
+
 def decode_token(token: str) -> Optional[dict]:
     try:
-        return jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        return jwt.decode(
+            token, SECRET_KEY, algorithms=[ALGORITHM],
+            leeway=timedelta(days=TOKEN_GRACE_DAYS),
+        )
     except JWTError:
         return None
 
