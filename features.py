@@ -738,6 +738,33 @@ async def admin_import_stickers(
     )
 
 
+class AdminPackSummary(BaseModel):
+    pack_id: int
+    name: str
+    source: str
+    is_default: bool
+    sticker_count: int
+
+
+@sticker_router.get("/admin/packs", response_model=List[AdminPackSummary])
+def admin_list_packs(
+    x_admin_key: Optional[str] = Header(None),
+    db: Session = Depends(get_db),
+):
+    """Quick status check — how many packs exist and how many stickers are
+    in each, without needing a logged-in user token."""
+    require_admin(x_admin_key)
+    packs = db.query(StickerPack).all()
+    out = []
+    for p in packs:
+        count = db.query(Sticker).filter(Sticker.pack_id == p.id).count()
+        out.append(AdminPackSummary(
+            pack_id=p.id, name=p.name, source=p.source,
+            is_default=p.is_default, sticker_count=count,
+        ))
+    return out
+
+
 class AdminDeletePackResult(BaseModel):
     pack_id: int
     deleted_stickers: int
