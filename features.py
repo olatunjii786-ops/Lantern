@@ -26,6 +26,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional, List
 
 from fastapi import APIRouter, File, UploadFile, HTTPException, Form, Depends, Header
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, UniqueConstraint, func, Boolean
 from sqlalchemy.orm import Session
@@ -660,18 +661,22 @@ _IMAGE_EXT_TO_CONTENT_TYPE = {
 }
 
 
-@sticker_router.post("/admin/import", response_model=AdminImportResult)
+@sticker_router.post("/admin/import")
 async def admin_import_stickers(
     pack_name: str = Form(...),
     zip_file: UploadFile = File(...),
     x_admin_key: Optional[str] = Header(None),
-    db: Session = Depends(get_db),
 ):
     """Bulk-import a zipped folder of sticker images (e.g. an exported
     WhatsApp stickers folder, zipped) as one admin-curated pack, visible to
     every user by default — no per-user download step. Call again with the
     same pack_name to add more (e.g. if you're splitting a huge folder
-    into a few zips to stay under Render's request size limit)."""
+    into a few zips to stay under Render's request size limit).
+
+    Streams one JSON line per file as it's processed (newline-delimited
+    JSON), so progress is visible live in curl instead of waiting silently
+    for one big response — also means if it crashes partway through,
+    you can see exactly which file it was on."""
     require_admin(x_admin_key)
     if not (B2_KEY_ID and B2_APP_KEY and B2_ENDPOINT_URL and B2_BUCKET_NAME):
         raise HTTPException(status_code=503, detail="Media storage not configured")
@@ -683,58 +688,78 @@ async def admin_import_stickers(
     except zipfile.BadZipFile:
         raise HTTPException(status_code=400, detail="That file isn't a valid zip")
 
-    pack = (db.query(StickerPack)
-            .filter(StickerPack.source == "admin", StickerPack.name == pack_name)
-            .first())
-    if pack is None:
-        pack = StickerPack(source="admin", source_pack_id=None,
-                           name=pack_name, is_default=True)
-        db.add(pack)
-        db.commit()
-        db.refresh(pack)
+    import json as _json
 
-    added = 0
-    skipped = 0
-    errors: List[str] = []
-
-    for info in zf.infolist():
-        if info.is_dir():
-            continue
-        name = info.filename
-        base = name.rsplit("/", 1)[-1]
-        if base.startswith(".") or base.startswith("__MACOSX"):
-            skipped += 1
-            continue
-        ext = ("." + base.rsplit(".", 1)[-1].lower()) if "." in base else ""
-        ct = _IMAGE_EXT_TO_CONTENT_TYPE.get(ext)
-        if ct is None:
-            skipped += 1
-            continue
-        raw = None
+    def _generate():
+        # Opens its own DB session rather than using the request-scoped
+        # one from Depends(get_db) — that session gets closed as soon as
+        # this function returns the StreamingResponse, but this generator
+        # keeps running (and needs the DB) well after that point.
+        db = SessionLocal()
+        added = 0
+        skipped = 0
         try:
-            raw = zf.read(info)
-            if not raw:
-                skipped += 1
-                errors.append(f"{base}: empty (0 bytes) in zip")
-                continue
-            key = f"stickers/{uuid.uuid4().hex}{ext}"
-            upload_bytes(raw, key, ct)
-            db.add(Sticker(pack_id=pack.id, media_key=key, source_url=None))
-            added += 1
-        except Exception as e:
-            skipped += 1
-            # First 16 bytes in hex tell us what the file actually is —
-            # a real webp always starts with "52494646" (RIFF); anything
-            # else (e.g. all zeros, or a different signature) tells us
-            # immediately what's actually wrong instead of guessing.
-            head_hex = raw[:16].hex() if raw else "(no bytes read)"
-            errors.append(f"{base}: {len(raw) if raw else 0} bytes, "
-                          f"starts with {head_hex} — {e}")
+            pack = (db.query(StickerPack)
+                    .filter(StickerPack.source == "admin", StickerPack.name == pack_name)
+                    .first())
+            if pack is None:
+                pack = StickerPack(source="admin", source_pack_id=None,
+                                   name=pack_name, is_default=True)
+                db.add(pack)
+                db.commit()
+                db.refresh(pack)
 
-    db.commit()
-    return AdminImportResult(
-        pack_id=pack.id, pack_name=pack.name,
-        added=added, skipped=skipped, errors=errors[:20],
+            yield _json.dumps({"event": "start", "pack_id": pack.id,
+                               "pack_name": pack.name}) + "\n"
+
+            for info in zf.infolist():
+                if info.is_dir():
+                    continue
+                name = info.filename
+                base = name.rsplit("/", 1)[-1]
+                if base.startswith(".") or base.startswith("__MACOSX"):
+                    skipped += 1
+                    continue
+                ext = ("." + base.rsplit(".", 1)[-1].lower()) if "." in base else ""
+                ct = _IMAGE_EXT_TO_CONTENT_TYPE.get(ext)
+                if ct is None:
+                    skipped += 1
+                    continue
+                raw = None
+                try:
+                    raw = zf.read(info)
+                    if not raw:
+                        skipped += 1
+                        yield _json.dumps({"event": "skip", "file": base,
+                                          "reason": "empty (0 bytes) in zip"}) + "\n"
+                        continue
+                    key = f"stickers/{uuid.uuid4().hex}{ext}"
+                    upload_bytes(raw, key, ct)
+                    db.add(Sticker(pack_id=pack.id, media_key=key, source_url=None))
+                    db.commit()
+                    added += 1
+                    yield _json.dumps({"event": "added", "file": base,
+                                      "added_so_far": added}) + "\n"
+                except Exception as e:
+                    db.rollback()
+                    skipped += 1
+                    head_hex = raw[:16].hex() if raw else "(no bytes read)"
+                    yield _json.dumps({
+                        "event": "error", "file": base,
+                        "bytes": len(raw) if raw else 0,
+                        "starts_with": head_hex, "error": str(e),
+                    }) + "\n"
+
+            yield _json.dumps({"event": "done", "pack_id": pack.id,
+                               "added": added, "skipped": skipped}) + "\n"
+        except Exception as e:
+            yield _json.dumps({"event": "fatal", "error": str(e)}) + "\n"
+        finally:
+            db.close()
+
+    return StreamingResponse(
+        _generate(), media_type="application/x-ndjson",
+        headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
     )
 
 
