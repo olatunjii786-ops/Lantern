@@ -592,11 +592,10 @@ class StickerPack(Base):
     name = Column(String, nullable=False)
     thumb_url = Column(String, nullable=True)                      # our own signed/cached thumb, if any
     owner_id = Column(Integer, ForeignKey("users.id"), nullable=True)  # set for a user's custom pack
-    # Admin-curated packs (the bulk WhatsApp-folder import) are flagged
-    # is_default so every user sees them automatically — without this,
-    # "everyone has this pack" would mean one UserStickerPack row per
-    # user per pack, which doesn't scale for a 500-sticker pack shared
-    # by every user on the app.
+    # Unused — packs were briefly auto-included for every user via this
+    # flag; that's been reverted in favor of explicit opt-in downloads
+    # (via /stickers/download or /stickers/download_pack) for every pack,
+    # admin-curated included. Column kept rather than migrated away.
     is_default = Column(Boolean, nullable=False, default=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
@@ -704,7 +703,7 @@ async def admin_import_stickers(
                     .first())
             if pack is None:
                 pack = StickerPack(source="admin", source_pack_id=None,
-                                   name=pack_name, is_default=True)
+                                   name=pack_name)
                 db.add(pack)
                 db.commit()
                 db.refresh(pack)
@@ -868,6 +867,71 @@ class BrowseStickersOut(BaseModel):
     page: int
 
 
+class BrowsePackOut(BaseModel):
+    pack_id: int
+    name: str
+    thumb_url: Optional[str] = None
+    sticker_count: int
+
+
+@sticker_router.get("/browse_packs", response_model=List[BrowsePackOut])
+def browse_packs(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Admin-curated packs (e.g. a bulk-imported WhatsApp sticker folder)
+    available to download as a whole pack — shown in the Store screen
+    alongside KLIPY's item-by-item browse grid. Downloading one of these
+    is a single pack-level action (see /stickers/download_pack), unlike
+    KLIPY stickers which are downloaded one at a time."""
+    packs = (db.query(StickerPack)
+            .filter(StickerPack.source == "admin")
+            .order_by(StickerPack.created_at.desc())
+            .all())
+    out = []
+    for p in packs:
+        count = db.query(Sticker).filter(Sticker.pack_id == p.id).count()
+        if count == 0:
+            continue
+        first = db.query(Sticker).filter(Sticker.pack_id == p.id).first()
+        out.append(BrowsePackOut(
+            pack_id=p.id, name=p.name,
+            thumb_url=signed_url_for_key(first.media_key) if first else None,
+            sticker_count=count,
+        ))
+    return out
+
+
+class DownloadPackResult(BaseModel):
+    pack_id: int
+    sticker_count: int
+
+
+@sticker_router.post("/download_pack/{pack_id}", response_model=DownloadPackResult)
+def download_pack(
+    pack_id: int,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Link an entire admin-curated pack to this user in one action —
+    the pack-level equivalent of /stickers/download for KLIPY's
+    individual stickers."""
+    pack = db.query(StickerPack).filter(StickerPack.id == pack_id).first()
+    if pack is None:
+        raise HTTPException(status_code=404, detail="Pack not found")
+
+    existing_link = (db.query(UserStickerPack)
+                     .filter(UserStickerPack.user_id == user.id,
+                             UserStickerPack.pack_id == pack_id)
+                     .first())
+    if existing_link is None:
+        db.add(UserStickerPack(user_id=user.id, pack_id=pack_id))
+        db.commit()
+
+    count = db.query(Sticker).filter(Sticker.pack_id == pack_id).count()
+    return DownloadPackResult(pack_id=pack_id, sticker_count=count)
+
+
 @sticker_router.get("/browse", response_model=BrowseStickersOut)
 def browse_stickers(
     q: str = "",
@@ -1017,33 +1081,27 @@ def my_stickers(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    # Default (admin-curated) packs are available to everyone automatically
-    # — no per-user download/link row needed, since that wouldn't scale for
-    # a large shared pack. Downloaded packs are whatever this user picked
-    # up individually from the Store tab.
-    default_packs = db.query(StickerPack).filter(StickerPack.is_default == True).all()  # noqa: E712
+    # Opt-in only: a pack (admin-curated or KLIPY) shows here only once
+    # the user has explicitly downloaded it — via /stickers/download for
+    # a KLIPY sticker or /stickers/download_pack for an admin pack.
+    # is_default previously made admin packs show for everyone with no
+    # action needed; that's deliberately no longer the case.
     links = (db.query(UserStickerPack)
             .filter(UserStickerPack.user_id == user.id)
             .order_by(UserStickerPack.downloaded_at.desc())
             .all())
-
-    pack_ids = {p.id for p in default_packs} | {l.pack_id for l in links}
-    if not pack_ids:
+    if not links:
         return []
 
+    pack_ids = [l.pack_id for l in links]
     packs = {p.id: p for p in db.query(StickerPack).filter(StickerPack.id.in_(pack_ids)).all()}
     stickers_by_pack = {}
     for s in db.query(Sticker).filter(Sticker.pack_id.in_(pack_ids)).all():
         stickers_by_pack.setdefault(s.pack_id, []).append(s)
 
-    # Default packs first, then downloaded packs most-recent-first.
-    ordered_pack_ids = [p.id for p in default_packs] + [
-        l.pack_id for l in links if l.pack_id not in {p.id for p in default_packs}
-    ]
-
     out = []
-    for pid in ordered_pack_ids:
-        pack = packs.get(pid)
+    for link in links:
+        pack = packs.get(link.pack_id)
         if pack is None:
             continue
         rows = stickers_by_pack.get(pack.id, [])
