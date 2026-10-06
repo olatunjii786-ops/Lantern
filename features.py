@@ -629,7 +629,25 @@ class UserStickerPack(Base):
     )
 
 
-for _model in (StickerPack, Sticker, UserStickerPack):
+class UserSticker(Base):
+    """A single sticker saved individually — either tapped out of a large
+    admin pack's contents (rather than downloading the whole pack), or
+    saved from a sticker someone sent in a chat. Grouped into a synthetic
+    "Saved Stickers" pack in /stickers/mine, separate from fully
+    downloaded packs."""
+    __tablename__ = "user_stickers"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    sticker_id = Column(Integer, ForeignKey("stickers.id"), nullable=False, index=True)
+    saved_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "sticker_id", name="uq_user_sticker_once"),
+    )
+
+
+for _model in (StickerPack, Sticker, UserStickerPack, UserSticker):
     try:
         _model.__table__.create(bind=engine, checkfirst=True)
     except Exception as e:
@@ -902,6 +920,75 @@ def browse_packs(
     return out
 
 
+class PackStickerOut(BaseModel):
+    sticker_id: int
+    media_url: str
+    width: Optional[int] = None
+    height: Optional[int] = None
+    saved: bool
+
+
+@sticker_router.get("/pack/{pack_id}/contents", response_model=List[PackStickerOut])
+def pack_contents(
+    pack_id: int,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """List a pack's individual stickers so the Store screen can show
+    them all and let the user tap whichever ones they actually want,
+    instead of only offering a whole-pack download."""
+    pack = db.query(StickerPack).filter(StickerPack.id == pack_id).first()
+    if pack is None:
+        raise HTTPException(status_code=404, detail="Pack not found")
+
+    rows = db.query(Sticker).filter(Sticker.pack_id == pack_id).all()
+    saved_ids = {
+        r.sticker_id for r in
+        db.query(UserSticker.sticker_id)
+        .filter(UserSticker.user_id == user.id,
+                UserSticker.sticker_id.in_([s.id for s in rows]))
+        .all()
+    }
+    return [
+        PackStickerOut(
+            sticker_id=s.id,
+            media_url=signed_url_for_key(s.media_key) or "",
+            width=s.width, height=s.height,
+            saved=s.id in saved_ids,
+        )
+        for s in rows
+    ]
+
+
+class SaveStickerResult(BaseModel):
+    sticker_id: int
+    saved: bool
+
+
+@sticker_router.post("/save/{sticker_id}", response_model=SaveStickerResult)
+def save_sticker(
+    sticker_id: int,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Save one sticker individually — used both for tapping a single
+    sticker inside a pack's contents view, and for 'Add to Saved
+    Stickers' on a sticker someone sent in a chat."""
+    sticker = db.query(Sticker).filter(Sticker.id == sticker_id).first()
+    if sticker is None:
+        raise HTTPException(status_code=404, detail="Sticker not found")
+
+    existing = (db.query(UserSticker)
+               .filter(UserSticker.user_id == user.id,
+                       UserSticker.sticker_id == sticker_id)
+               .first())
+    if existing is None:
+        db.add(UserSticker(user_id=user.id, sticker_id=sticker_id))
+        db.commit()
+
+    return SaveStickerResult(sticker_id=sticker_id, saved=True)
+
+
 class DownloadPackResult(BaseModel):
     pack_id: int
     sticker_count: int
@@ -1084,37 +1171,64 @@ def my_stickers(
     # Opt-in only: a pack (admin-curated or KLIPY) shows here only once
     # the user has explicitly downloaded it — via /stickers/download for
     # a KLIPY sticker or /stickers/download_pack for an admin pack.
-    # is_default previously made admin packs show for everyone with no
-    # action needed; that's deliberately no longer the case.
+    # Individually saved stickers (tapped one at a time out of a pack's
+    # contents, or saved from a sticker someone sent in chat) aren't tied
+    # to a downloaded pack, so they're collected into one synthetic
+    # "Saved Stickers" pack (pack_id -1) at the front of the response.
     links = (db.query(UserStickerPack)
             .filter(UserStickerPack.user_id == user.id)
             .order_by(UserStickerPack.downloaded_at.desc())
             .all())
-    if not links:
+    individually_saved = (db.query(UserSticker)
+                          .filter(UserSticker.user_id == user.id)
+                          .order_by(UserSticker.saved_at.desc())
+                          .all())
+    if not links and not individually_saved:
         return []
 
-    pack_ids = [l.pack_id for l in links]
-    packs = {p.id: p for p in db.query(StickerPack).filter(StickerPack.id.in_(pack_ids)).all()}
-    stickers_by_pack = {}
-    for s in db.query(Sticker).filter(Sticker.pack_id.in_(pack_ids)).all():
-        stickers_by_pack.setdefault(s.pack_id, []).append(s)
-
     out = []
-    for link in links:
-        pack = packs.get(link.pack_id)
-        if pack is None:
-            continue
-        rows = stickers_by_pack.get(pack.id, [])
-        out.append(MyPackOut(
-            pack_id=pack.id,
-            name=pack.name,
-            stickers=[MyStickerOut(
-                sticker_id=s.id,
-                media_key=s.media_key,
-                media_url=signed_url_for_key(s.media_key) or "",
-                width=s.width, height=s.height,
-            ) for s in rows],
-        ))
+
+    if individually_saved:
+        sticker_ids = [us.sticker_id for us in individually_saved]
+        stickers_by_id = {
+            s.id: s for s in db.query(Sticker).filter(Sticker.id.in_(sticker_ids)).all()
+        }
+        saved_rows = [stickers_by_id[sid] for sid in sticker_ids if sid in stickers_by_id]
+        if saved_rows:
+            out.append(MyPackOut(
+                pack_id=-1,
+                name="Saved Stickers",
+                stickers=[MyStickerOut(
+                    sticker_id=s.id,
+                    media_key=s.media_key,
+                    media_url=signed_url_for_key(s.media_key) or "",
+                    width=s.width, height=s.height,
+                ) for s in saved_rows],
+            ))
+
+    if links:
+        pack_ids = [l.pack_id for l in links]
+        packs = {p.id: p for p in db.query(StickerPack).filter(StickerPack.id.in_(pack_ids)).all()}
+        stickers_by_pack = {}
+        for s in db.query(Sticker).filter(Sticker.pack_id.in_(pack_ids)).all():
+            stickers_by_pack.setdefault(s.pack_id, []).append(s)
+
+        for link in links:
+            pack = packs.get(link.pack_id)
+            if pack is None:
+                continue
+            rows = stickers_by_pack.get(pack.id, [])
+            out.append(MyPackOut(
+                pack_id=pack.id,
+                name=pack.name,
+                stickers=[MyStickerOut(
+                    sticker_id=s.id,
+                    media_key=s.media_key,
+                    media_url=signed_url_for_key(s.media_key) or "",
+                    width=s.width, height=s.height,
+                ) for s in rows],
+            ))
+
     return out
 
 
