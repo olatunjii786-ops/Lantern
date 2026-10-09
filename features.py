@@ -989,6 +989,50 @@ def save_sticker(
     return SaveStickerResult(sticker_id=sticker_id, saved=True)
 
 
+class CreateCustomStickerIn(BaseModel):
+    media_key: str
+
+
+class CreateCustomStickerResult(BaseModel):
+    sticker_id: int
+    pack_id: int
+    media_url: str
+
+
+@sticker_router.post("/custom/create", response_model=CreateCustomStickerResult)
+def create_custom_sticker(
+    body: CreateCustomStickerIn,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Add a sticker the user made themselves (cropped/edited in the
+    in-app sticker creator, already uploaded via /media/upload) into
+    their own personal pack — created on first use — and save it to
+    their collection immediately, same as any other saved sticker."""
+    pack = (db.query(StickerPack)
+            .filter(StickerPack.source == "custom", StickerPack.owner_id == user.id)
+            .first())
+    if pack is None:
+        pack = StickerPack(source="custom", source_pack_id=None,
+                           name="My Stickers", owner_id=user.id)
+        db.add(pack)
+        db.commit()
+        db.refresh(pack)
+
+    sticker = Sticker(pack_id=pack.id, media_key=body.media_key, source_url=None)
+    db.add(sticker)
+    db.commit()
+    db.refresh(sticker)
+
+    db.add(UserSticker(user_id=user.id, sticker_id=sticker.id))
+    db.commit()
+
+    return CreateCustomStickerResult(
+        sticker_id=sticker.id, pack_id=pack.id,
+        media_url=signed_url_for_key(sticker.media_key) or "",
+    )
+
+
 class DownloadPackResult(BaseModel):
     pack_id: int
     sticker_count: int
