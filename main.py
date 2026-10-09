@@ -12,6 +12,8 @@ Includes:
 - Daily quote bot post
 - Global Room, releases / admin panel, broadcast
 - Bot account ("thegoodboy")
+- Change password (user-facing)
+- Admin: reset any user's password
 
 Phase A+ features live in features.py and are registered at the bottom.
 """
@@ -46,6 +48,7 @@ ONLINE_WINDOW_SECONDS = 300
 MAX_AVATAR_BYTES = 200_000
 ROOM_RATE_LIMIT_SECONDS = 2
 EDIT_WINDOW_SECONDS = 20 * 60
+MIN_PASSWORD_LENGTH = 8
 
 BOT_USERNAME = "thegoodboy"
 BOT_BIO = "Your guide to Lantern. I welcome new users, post announcements, and answer app questions. I'm a bot — not a person. Type 'help' any time."
@@ -381,6 +384,15 @@ def bot_reply(db: Session, user: User, text: str) -> str:
             "I never read your other chats."
         )
 
+    if "password" in t or "login" in t or "sign in" in t:
+        return (
+            "Password help:\n\n"
+            "• To change your password: Profile → Change password\n"
+            "• If you forgot it, ask an admin to reset it for you\n"
+            "• If login says 'credentials not found', that message is usually\n"
+            "  your phone's password manager, not Lantern — try typing it manually."
+        )
+
     if "discover" in t or "find" in t or "people" in t or "meet" in t:
         return (
             "To find people:\n\n"
@@ -455,6 +467,16 @@ class ProfileUpdate(BaseModel):
     show_bio: Optional[bool] = None
     show_interests: Optional[bool] = None
     show_online: Optional[bool] = None
+
+
+class ChangePasswordIn(BaseModel):
+    old_password: str
+    new_password: str
+
+
+class AdminResetPasswordIn(BaseModel):
+    username: str
+    new_password: str
 
 
 class DiscoverUser(BaseModel):
@@ -613,7 +635,10 @@ def hash_password(password: str) -> str:
 
 
 def verify_password(plain: str, hashed: str) -> bool:
-    return bcrypt.checkpw(plain.encode("utf-8"), hashed.encode("utf-8"))
+    try:
+        return bcrypt.checkpw(plain.encode("utf-8"), hashed.encode("utf-8"))
+    except Exception:
+        return False
 
 
 def create_access_token(user_id: int, username: str) -> str:
@@ -883,6 +908,12 @@ def register(data: UserCreate, db: Session = Depends(get_db)):
     if data.username.lower() == BOT_USERNAME:
         raise HTTPException(status_code=400, detail="That username is reserved")
 
+    if len(data.password or "") < MIN_PASSWORD_LENGTH:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Password must be at least {MIN_PASSWORD_LENGTH} characters",
+        )
+
     if db.query(User).filter(User.username == data.username).first():
         raise HTTPException(status_code=400, detail="Username already taken")
     if data.email and db.query(User).filter(User.email == data.email).first():
@@ -923,8 +954,13 @@ def register(data: UserCreate, db: Session = Depends(get_db)):
 
 @app.post("/auth/login", response_model=Token)
 def login(form: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+    # Accepts username, email, OR phone — whichever the user registered with.
     user = db.query(User).filter(
-        or_(User.username == form.username, User.email == form.username)
+        or_(
+            User.username == form.username,
+            User.email == form.username,
+            User.phone == form.username,
+        )
     ).first()
     if not user or not verify_password(form.password, user.hashed_password):
         raise HTTPException(status_code=401, detail="Invalid credentials")
@@ -946,6 +982,40 @@ def me(user: User = Depends(get_current_user)):
         show_bio=user.show_bio, show_interests=user.show_interests, show_online=user.show_online,
         online=True,
     )
+
+
+@app.post("/auth/change_password")
+def change_password(
+    data: ChangePasswordIn,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Change the signed-in user's own password.
+
+    Deliberately returns 400 (not 401) for a wrong current password:
+    the Android client treats any 401 as 'session expired' and force-logs
+    the user out, which would be wrong for a typo in this field."""
+    if user.is_bot:
+        raise HTTPException(status_code=403, detail="Not a user account")
+
+    if not user.hashed_password:
+        raise HTTPException(status_code=400, detail="Account has no password set")
+
+    if not verify_password(data.old_password, user.hashed_password):
+        raise HTTPException(status_code=400, detail="Current password is incorrect")
+
+    new_pw = (data.new_password or "").strip()
+    if len(new_pw) < MIN_PASSWORD_LENGTH:
+        raise HTTPException(
+            status_code=400,
+            detail=f"New password must be at least {MIN_PASSWORD_LENGTH} characters",
+        )
+    if new_pw == data.old_password:
+        raise HTTPException(status_code=400, detail="New password must be different")
+
+    user.hashed_password = hash_password(new_pw)
+    db.commit()
+    return {"ok": True}
 
 
 @app.delete("/users/me")
@@ -1894,6 +1964,37 @@ def admin_rename_room(data: RenameRoomIn,
 
 
 # ---------------------------------------------------------------------
+# Admin — Password reset
+# ---------------------------------------------------------------------
+
+@app.post("/admin/reset_password")
+def admin_reset_password(data: AdminResetPasswordIn,
+                         x_admin_key: Optional[str] = Header(None),
+                         db: Session = Depends(get_db)):
+    """Set a new password for any user. ADMIN_KEY protected. Use when a
+    user has genuinely forgotten theirs and there's no email flow yet."""
+    require_admin(x_admin_key)
+    user = db.query(User).filter(User.username == data.username).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    if user.deleted_at is not None:
+        raise HTTPException(status_code=403, detail="Account is deleted")
+    if user.is_bot:
+        raise HTTPException(status_code=403, detail="Not a user account")
+
+    new_pw = (data.new_password or "").strip()
+    if len(new_pw) < MIN_PASSWORD_LENGTH:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Password must be at least {MIN_PASSWORD_LENGTH} characters",
+        )
+
+    user.hashed_password = hash_password(new_pw)
+    db.commit()
+    return {"ok": True, "username": user.username}
+
+
+# ---------------------------------------------------------------------
 # Broadcast
 # ---------------------------------------------------------------------
 
@@ -2050,6 +2151,7 @@ ADMIN_HTML = """<!DOCTYPE html>
     <button class="tab active" onclick="switchTab('releases', event)">Releases</button>
     <button class="tab" onclick="switchTab('broadcast', event)">Broadcast</button>
     <button class="tab" onclick="switchTab('room', event)">Global Room</button>
+    <button class="tab" onclick="switchTab('password', event)">Reset Password</button>
   </div>
 
   <div class="pane active" id="pane-releases">
@@ -2116,6 +2218,26 @@ ADMIN_HTML = """<!DOCTYPE html>
       <button class="primary" id="roomBtn" onclick="renameRoom()">Save room name</button>
       <div class="error" id="rerror"></div>
       <div class="success" id="rresult"></div>
+    </div>
+  </div>
+
+  <div class="pane" id="pane-password">
+    <div class="card">
+      <h3 style="margin-top:0;font-size:15px;font-weight:500">Reset a user's password</h3>
+      <div class="sub" style="margin-bottom:16px">
+        Sets a new password for the given username. The user logs in with it and changes it in-app.
+      </div>
+      <div class="field">
+        <label>Username</label>
+        <input id="pwUser" type="text" placeholder="derek">
+      </div>
+      <div class="field">
+        <label>New password (at least 8 characters)</label>
+        <input id="pwNew" type="text" placeholder="LanternTemp2026!">
+      </div>
+      <button class="primary" id="pwBtn" onclick="resetPassword()">Reset password</button>
+      <div class="error" id="pwerror"></div>
+      <div class="success" id="pwresult"></div>
     </div>
   </div>
 </div>
@@ -2191,6 +2313,45 @@ async function renameRoom() {
     document.getElementById('rerror').textContent = 'Network error';
   } finally {
     document.getElementById('roomBtn').disabled = false;
+  }
+}
+
+async function resetPassword() {
+  const key = document.getElementById('key').value;
+  if (!key) { document.getElementById('pwerror').textContent = 'Enter admin key'; return; }
+
+  const username = document.getElementById('pwUser').value.trim();
+  const newPw = document.getElementById('pwNew').value;
+  if (!username) { document.getElementById('pwerror').textContent = 'Username required'; return; }
+  if (newPw.length < 8) { document.getElementById('pwerror').textContent = 'Password must be at least 8 chars'; return; }
+
+  document.getElementById('pwerror').textContent = '';
+  document.getElementById('pwresult').textContent = '';
+  document.getElementById('pwBtn').disabled = true;
+
+  try {
+    const r = await fetch('/admin/reset_password', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Admin-Key': key
+      },
+      body: JSON.stringify({ username: username, new_password: newPw })
+    });
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({}));
+      document.getElementById('pwerror').textContent = err.detail || 'Reset failed';
+    } else {
+      document.getElementById('pwresult').textContent =
+        'Password reset for "' + username + '".';
+      document.getElementById('pwUser').value = '';
+      document.getElementById('pwNew').value = '';
+      toast('Password reset');
+    }
+  } catch (e) {
+    document.getElementById('pwerror').textContent = 'Network error';
+  } finally {
+    document.getElementById('pwBtn').disabled = false;
   }
 }
 
