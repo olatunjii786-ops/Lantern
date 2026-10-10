@@ -1260,6 +1260,8 @@ def get_global_room_info(user: User = Depends(get_current_user),
                         text = f"📎 {last.media_name}"
                     else:
                         text = "📎 File"
+                elif kind == "sticker":
+                    text = "Sticker"
             if len(text) > 80:
                 text = text[:77] + "..."
             preview = f"{sender_label}: {text}"
@@ -1525,6 +1527,8 @@ def conversations(user: User = Depends(get_current_user),
                     text_preview = f"📎 {media_name}"
                 else:
                     text_preview = "📎 File"
+            elif kind == "sticker":
+                text_preview = "Sticker"
             else:
                 text_preview = ""
 
