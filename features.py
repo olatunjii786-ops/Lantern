@@ -1761,11 +1761,238 @@ def handle_feature_ws(user_id: int, username: str, db: Session,
 # Registration
 # ---------------------------------------------------------------------
 
+# ---------------------------------------------------------------------
+# Push notifications (FCM)
+# ---------------------------------------------------------------------
+#
+# The app's foreground-service WebSocket can't be relied on to stay alive
+# (Android and OEM battery managers kill it), so anyone whose socket isn't
+# connected gets a real FCM push instead — delivered through Google Play
+# Services, which doesn't depend on the app process running.
+#
+# Setup (server): set FIREBASE_SERVICE_ACCOUNT_JSON in the environment to
+# the *contents* of the Firebase service-account key JSON. No extra pip
+# packages — the OAuth token is minted with python-jose (already a
+# dependency) and requests go through urllib like the rest of this file.
+
+import json as _fcm_json
+import time as _fcm_time
+import threading as _fcm_threading
+import urllib.parse as _fcm_urlparse
+
+FIREBASE_SERVICE_ACCOUNT_JSON = os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON", "")
+FCM_CHANNEL_ID = "lantern_messages_channel"
+ROOM_PUSH_COOLDOWN_SECONDS = 600  # at most one Global Room push per user per 10 min
+
+
+class DeviceToken(Base):
+    __tablename__ = "device_tokens"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    token = Column(String, nullable=False, unique=True, index=True)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+try:
+    DeviceToken.__table__.create(bind=engine, checkfirst=True)
+except Exception as e:
+    print(f"[features] could not create device_tokens table: {e!r}")
+
+
+_fcm_cache = {"access_token": None, "expires_at": 0.0}
+_room_push_last: dict = {}
+
+
+def _fcm_service_account() -> Optional[dict]:
+    if not FIREBASE_SERVICE_ACCOUNT_JSON:
+        return None
+    try:
+        info = _fcm_json.loads(FIREBASE_SERVICE_ACCOUNT_JSON, strict=False)
+        if info.get("client_email") and info.get("private_key") and info.get("project_id"):
+            return info
+    except Exception as e:
+        print(f"[features] FIREBASE_SERVICE_ACCOUNT_JSON is not valid JSON: {e!r}")
+    return None
+
+
+def _fcm_access_token(info: dict) -> Optional[str]:
+    now = _fcm_time.time()
+    if _fcm_cache["access_token"] and _fcm_cache["expires_at"] - 60 > now:
+        return _fcm_cache["access_token"]
+    try:
+        from jose import jwt as _jose_jwt
+        iat = int(now)
+        assertion = _jose_jwt.encode(
+            {
+                "iss": info["client_email"],
+                "scope": "https://www.googleapis.com/auth/firebase.messaging",
+                "aud": "https://oauth2.googleapis.com/token",
+                "iat": iat,
+                "exp": iat + 3600,
+            },
+            info["private_key"],
+            algorithm="RS256",
+        )
+        body = _fcm_urlparse.urlencode({
+            "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+            "assertion": assertion,
+        }).encode("utf-8")
+        req = urllib.request.Request("https://oauth2.googleapis.com/token", data=body)
+        req.add_header("Content-Type", "application/x-www-form-urlencoded")
+        with urllib.request.urlopen(req, timeout=15) as r:
+            resp = _fcm_json.loads(r.read().decode("utf-8"))
+        _fcm_cache["access_token"] = resp.get("access_token")
+        _fcm_cache["expires_at"] = now + int(resp.get("expires_in", 3600))
+        return _fcm_cache["access_token"]
+    except Exception as e:
+        print(f"[features] FCM access-token fetch failed: {e!r}")
+        return None
+
+
+def _fcm_send_one(info: dict, access: str, token: str, title: str, body: str,
+                  data: dict) -> str:
+    """Returns "ok", "unregistered" (token is dead — delete it) or "error"."""
+    message = {
+        "message": {
+            "token": token,
+            "notification": {"title": title, "body": body},
+            "data": {k: str(v) for k, v in (data or {}).items()},
+            "android": {
+                "priority": "HIGH",
+                "notification": {"channel_id": FCM_CHANNEL_ID},
+            },
+        }
+    }
+    url = f"https://fcm.googleapis.com/v1/projects/{info['project_id']}/messages:send"
+    try:
+        req = urllib.request.Request(url, data=_fcm_json.dumps(message).encode("utf-8"))
+        req.add_header("Authorization", f"Bearer {access}")
+        req.add_header("Content-Type", "application/json")
+        with urllib.request.urlopen(req, timeout=15) as r:
+            r.read()
+        return "ok"
+    except urllib.error.HTTPError as e:
+        try:
+            detail = e.read().decode("utf-8", "ignore")
+        except Exception:
+            detail = ""
+        if e.code == 404 or "UNREGISTERED" in detail:
+            return "unregistered"
+        print(f"[features] FCM send failed {e.code}: {detail[:300]}")
+        return "error"
+    except Exception as e:
+        print(f"[features] FCM send failed: {e!r}")
+        return "error"
+
+
+def _push_worker(user_ids: List[int], title: str, body: str, data: dict):
+    info = _fcm_service_account()
+    if info is None:
+        return
+    access = _fcm_access_token(info)
+    if not access:
+        return
+    db = SessionLocal()
+    try:
+        rows = db.query(DeviceToken).filter(DeviceToken.user_id.in_(user_ids)).all()
+        for row in rows:
+            result = _fcm_send_one(info, access, row.token, title, body, data)
+            if result == "unregistered":
+                db.delete(row)
+        db.commit()
+    except Exception as e:
+        print(f"[features] push worker failed: {e!r}")
+        db.rollback()
+    finally:
+        db.close()
+
+
+def push_notify(user_ids: List[int], title: str, body: str, data: Optional[dict] = None):
+    """Fire-and-forget push to every registered device of these users.
+    Runs on a background thread so message-sending never waits on FCM."""
+    if not user_ids or not FIREBASE_SERVICE_ACCOUNT_JSON:
+        return
+    _fcm_threading.Thread(
+        target=_push_worker, args=(list(user_ids), title, body, data or {}),
+        daemon=True,
+    ).start()
+
+
+def push_notify_room(exclude_user_id: int, online_ids, title: str, body: str,
+                     data: Optional[dict] = None):
+    """Global Room push: everyone with a registered device who isn't the
+    sender and isn't already connected over WebSocket — rate-limited per
+    user so a busy room can't spam people (there's no mute control yet)."""
+    if not FIREBASE_SERVICE_ACCOUNT_JSON:
+        return
+    db = SessionLocal()
+    try:
+        ids = {r[0] for r in db.query(DeviceToken.user_id).distinct().all()}
+    finally:
+        db.close()
+    now = _fcm_time.time()
+    targets = []
+    for uid in ids:
+        if uid == exclude_user_id or uid in online_ids:
+            continue
+        if now - _room_push_last.get(uid, 0) < ROOM_PUSH_COOLDOWN_SECONDS:
+            continue
+        _room_push_last[uid] = now
+        targets.append(uid)
+    push_notify(targets, title, body, data)
+
+
+class RegisterDeviceIn(BaseModel):
+    token: str
+
+
+device_router = APIRouter(prefix="/devices", tags=["devices"])
+
+
+@device_router.post("/register")
+def register_device(
+    body: RegisterDeviceIn,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Called by the app on launch/login with its current FCM token. A
+    token belongs to one device, so if it was last registered under a
+    different account (someone logged out and another logged in on the
+    same phone) it moves to the current user."""
+    token = (body.token or "").strip()
+    if not token:
+        raise HTTPException(status_code=400, detail="Empty token")
+    row = db.query(DeviceToken).filter(DeviceToken.token == token).first()
+    if row is None:
+        db.add(DeviceToken(user_id=user.id, token=token))
+    else:
+        row.user_id = user.id
+    db.commit()
+    return {"ok": True}
+
+
+@device_router.post("/unregister")
+def unregister_device(
+    body: RegisterDeviceIn,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Called on logout so a logged-out phone stops getting that user's pushes."""
+    db.query(DeviceToken).filter(
+        DeviceToken.token == (body.token or "").strip(),
+        DeviceToken.user_id == user.id,
+    ).delete()
+    db.commit()
+    return {"ok": True}
+
+
 def register_features(app):
     app.include_router(media_router)
     app.include_router(reactions_router)
     app.include_router(presence_router)
     app.include_router(sticker_router)
+    app.include_router(device_router)
 
     @app.on_event("startup")
     def _features_startup():

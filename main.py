@@ -1417,6 +1417,7 @@ def post_global_room_message(data: SendRoomMessageIn,
         asyncio.create_task(manager.broadcast_except(user.id, payload_out))
     except Exception:
         pass
+    push_new_room_message(msg)
 
     resp = {
         "id": msg.id,
@@ -1728,6 +1729,7 @@ def post_message(data: SendMessageIn,
         asyncio.create_task(manager.send_to(data.to, payload_out))
     except Exception:
         pass
+    push_new_dm(msg)
 
     if receiver.is_bot:
         try:
@@ -2579,6 +2581,56 @@ class ConnectionManager:
 manager = ConnectionManager()
 
 
+def _push_preview_text(msg) -> str:
+    kind = (getattr(msg, "type", None) or "text").lower()
+    if kind == "image":
+        return "📷 Photo"
+    if kind == "video":
+        return "🎬 Video"
+    if kind == "voice":
+        return "🎤 Voice message"
+    if kind == "sticker":
+        return "Sticker"
+    if kind == "file":
+        return f"📎 {msg.media_name}" if getattr(msg, "media_name", None) else "📎 File"
+    text = (msg.content or "").strip()
+    return text[:120] if text else "New message"
+
+
+def push_new_dm(msg):
+    """FCM push for a 1-1 message — only if the receiver has no live
+    WebSocket (a connected socket already delivers it)."""
+    try:
+        rid = msg.receiver_id
+        if rid is None or rid in manager.active:
+            return
+        sender = msg.sender
+        if sender is None:
+            return
+        from features import push_notify
+        push_notify([rid], display_name_of(sender), _push_preview_text(msg),
+                    {"type": "dm", "from_id": sender.id,
+                     "from_username": sender.username, "message_id": msg.id})
+    except Exception as e:
+        print(f"[push] dm push failed: {e!r}")
+
+
+def push_new_room_message(msg):
+    """FCM push for a Global Room message, rate-limited per user."""
+    try:
+        sender = msg.sender
+        if sender is None:
+            return
+        from features import push_notify_room
+        push_notify_room(
+            sender.id, set(manager.active.keys()), "Global Room",
+            f"{display_name_of(sender)}: {_push_preview_text(msg)}",
+            {"type": "room", "message_id": msg.id},
+        )
+    except Exception as e:
+        print(f"[push] room push failed: {e!r}")
+
+
 def _ws_handle_message(db: Session, user_id: int, username: str, data: dict) -> None:
     msg_type = (data.get("type") or "message").strip()
 
@@ -2697,6 +2749,7 @@ def _ws_handle_message(db: Session, user_id: int, username: str, data: dict) -> 
             asyncio.create_task(manager.broadcast_except(user_id, payload_out))
         except Exception:
             pass
+        push_new_room_message(msg)
         return
 
     receiver_id = data.get("to")
@@ -2753,6 +2806,7 @@ def _ws_handle_message(db: Session, user_id: int, username: str, data: dict) -> 
         asyncio.create_task(manager.send_to(receiver_id, payload_out))
     except Exception:
         pass
+    push_new_dm(msg)
 
     if receiver.is_bot:
         try:
