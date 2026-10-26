@@ -1972,6 +1972,57 @@ def register_device(
     return {"ok": True}
 
 
+@device_router.post("/admin/test_push")
+def admin_test_push(
+    username: Optional[str] = None,
+    x_admin_key: Optional[str] = Header(None),
+    db: Session = Depends(get_db),
+):
+    """Admin-only: push a test notification straight to registered
+    devices and report each step, so a silent FCM failure is visible
+    (service account missing? no device registered? Google rejected it?).
+    With no username it targets every registered device."""
+    require_admin(x_admin_key)
+    report = {"service_account_configured": False, "target": username or "all",
+              "registered_devices": 0, "access_token_ok": False, "results": []}
+
+    info = _fcm_service_account()
+    report["service_account_configured"] = info is not None
+    if info is None:
+        report["hint"] = ("FIREBASE_SERVICE_ACCOUNT_JSON is missing or not valid "
+                          "JSON in the server environment")
+        return report
+
+    q = db.query(DeviceToken)
+    if username:
+        u = db.query(User).filter(User.username == username).first()
+        if u is None:
+            report["hint"] = "No user with that username"
+            return report
+        q = q.filter(DeviceToken.user_id == u.id)
+    rows = q.all()
+    report["registered_devices"] = len(rows)
+    if not rows:
+        report["hint"] = ("No device has registered a push token yet — open the "
+                          "app (logged in) on the rebuilt version once, then retry")
+        return report
+
+    access = _fcm_access_token(info)
+    report["access_token_ok"] = bool(access)
+    if not access:
+        report["hint"] = "Couldn't get a Google access token — see server logs"
+        return report
+
+    for row in rows:
+        result = _fcm_send_one(info, access, row.token, "Lantern test",
+                               "Push notifications are working 🎉", {"type": "test"})
+        report["results"].append({"user_id": row.user_id, "result": result})
+        if result == "unregistered":
+            db.delete(row)
+    db.commit()
+    return report
+
+
 @device_router.post("/unregister")
 def unregister_device(
     body: RegisterDeviceIn,
