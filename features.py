@@ -1853,15 +1853,18 @@ def _fcm_access_token(info: dict) -> Optional[str]:
 def _fcm_send_one(info: dict, access: str, token: str, title: str, body: str,
                   data: dict) -> str:
     """Returns "ok", "unregistered" (token is dead — delete it) or "error"."""
+    # Data-only on purpose: with a "notification" block the Firebase
+    # library draws the notification itself, and the old version bundled
+    # in the app crashes doing so on Android 12+. The app's
+    # LanternMessagingService shows it instead, from title/body below.
+    payload_data = {k: str(v) for k, v in (data or {}).items()}
+    payload_data["title"] = title
+    payload_data["body"] = body
     message = {
         "message": {
             "token": token,
-            "notification": {"title": title, "body": body},
-            "data": {k: str(v) for k, v in (data or {}).items()},
-            "android": {
-                "priority": "HIGH",
-                "notification": {"channel_id": FCM_CHANNEL_ID},
-            },
+            "data": payload_data,
+            "android": {"priority": "HIGH"},
         }
     }
     url = f"https://fcm.googleapis.com/v1/projects/{info['project_id']}/messages:send"
